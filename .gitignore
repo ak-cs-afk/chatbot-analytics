@@ -8,3 +8,5 @@ __pycache__/
 .DS_Store
 *.egg-info/
 data/olist.db
+data/saved_charts.json
+data/saved_charts.corrupt-*.json

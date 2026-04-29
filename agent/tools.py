@@ -1,38 +1,55 @@
 from __future__ import annotations
 
 import json
-import re
-import sqlite3
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import plotly.graph_objects as go
 
 from charts.renderer import ChartSpecError, spec_to_figure
-from datasets.base import Dataset
+from features.catalog import find_features
+from features.loader import (
+    Feature,
+    FeatureNotFoundError,
+    load_features,
+)
 
 
-MAX_ROWS = 1000
-SQL_TIMEOUT_SECONDS = 5
 ALLOWED_STATS_OPS = {"min", "max", "mean", "median", "std", "sum", "count", "p25", "p75"}
+
+
+# ---------- Public types ----------
+
+@dataclass
+class ChartMeta:
+    chart_id: int
+    name: str
+    feature_id: str
+    spec: dict
+    figure: go.Figure
+
+
+# ---------- Tool schemas (OpenAI function-calling format) ----------
 
 TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "run_sql",
+            "name": "get_feature_data",
             "description": (
-                "Run a read-only SELECT query against the active SQLite dataset. "
-                "Returns up to 1000 rows. Multi-statement queries are rejected."
+                "Fetch the data rows and chart hints for a single feature by its ID "
+                "(e.g. 'F001'). Returns columns, rows, and the suggested chart type/axes."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
+                    "feature_id": {
                         "type": "string",
-                        "description": "A single SQL SELECT (or WITH ... SELECT) statement.",
+                        "description": "Feature ID like 'F001', 'F002', etc.",
                     }
                 },
-                "required": ["query"],
+                "required": ["feature_id"],
             },
         },
     },
@@ -41,25 +58,30 @@ TOOLS: list[dict] = [
         "function": {
             "name": "make_chart",
             "description": (
-                "Render a Plotly chart from a spec and tabular data. "
-                "Use this after run_sql when the user wants a visualization."
+                "Build a Plotly chart for a feature. Defaults to the feature's "
+                "suggested chart and axes; pass spec_override to swap chart type, "
+                "change axes, or add a color grouping. Always tied to a feature_id "
+                "so saved dashboards re-render from latest data."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "spec": {
+                    "feature_id": {"type": "string"},
+                    "title": {
+                        "type": "string",
+                        "description": "Default name shown above the chart. Will be the chart's display name.",
+                    },
+                    "spec_override": {
                         "type": "object",
                         "description": (
-                            "Chart spec. Keys: type (bar|line|scatter|pie|histogram|box|heatmap), "
-                            "x, y, color (optional), title, names+values (pie only), z (heatmap only)."
+                            "Optional partial spec to override defaults. Keys: type "
+                            "(bar|line|scatter|pie|histogram|box|heatmap|funnel|"
+                            "grouped_bar|horizontal_bar), x, y, y_fields, color, "
+                            "names, values, z."
                         ),
                     },
-                    "data": {
-                        "type": "object",
-                        "description": "Tabular data with keys 'columns' (list of names) and 'rows' (list of lists).",
-                    },
                 },
-                "required": ["spec", "data"],
+                "required": ["feature_id", "title"],
             },
         },
     },
@@ -74,14 +96,8 @@ TOOLS: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "values": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                    },
-                    "ops": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
+                    "values": {"type": "array", "items": {"type": "number"}},
+                    "ops": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["values", "ops"],
             },
@@ -90,109 +106,120 @@ TOOLS: list[dict] = [
 ]
 
 
-def dispatch(name: str, args: dict, dataset: Dataset, turn) -> dict:
-    """Route a tool call to the right impl. Returns a JSON-serializable dict."""
+# ---------- Public dispatcher ----------
+
+def dispatch(name: str, args: dict, turn) -> dict:
+    """Route a tool call. Returns a JSON-serializable dict."""
     try:
-        if name == "run_sql":
-            return run_sql(args.get("query", ""), dataset)
+        if name == "get_feature_data":
+            return get_feature_data(args.get("feature_id", ""))
         if name == "make_chart":
-            return make_chart(args.get("spec", {}), args.get("data", {}), turn)
+            return make_chart(
+                feature_id=args.get("feature_id", ""),
+                title=args.get("title", ""),
+                spec_override=args.get("spec_override"),
+                turn=turn,
+            )
         if name == "compute_stats":
             return compute_stats(args.get("values", []), args.get("ops", []))
         return {"ok": False, "error": f"Unknown tool: {name}"}
-    except Exception as exc:  # last-resort guard so the loop keeps going
+    except Exception as exc:
         return {"ok": False, "error": f"Tool {name} crashed: {exc}"}
-    
-
-# ---------- run_sql ----------
-
-_SELECT_PATTERN = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 
 
-def run_sql(query: str, dataset: Dataset) -> dict:
-    if not isinstance(query, str) or not query.strip():
-        return {"ok": False, "error": "Query is empty."}
+# ---------- get_feature_data ----------
 
-    if not _SELECT_PATTERN.match(query):
-        return {"ok": False, "error": "Only SELECT or WITH ... SELECT queries are allowed."}
-
-    if _has_multiple_statements(query):
-        return {"ok": False, "error": "Multiple SQL statements are not allowed."}
-
-    conn = sqlite3.connect(f"file:{dataset.db_path}?mode=ro", uri=True)
-    try:
-        _install_timeout(conn, SQL_TIMEOUT_SECONDS)
-        cursor = conn.execute(query)
-        rows = cursor.fetchmany(MAX_ROWS + 1)
-        truncated = len(rows) > MAX_ROWS
-        rows = rows[:MAX_ROWS]
-        columns = [d[0] for d in cursor.description] if cursor.description else []
+def get_feature_data(feature_id: str) -> dict:
+    if not feature_id:
+        return {"ok": False, "error": "feature_id is required."}
+    catalog = load_features()
+    if feature_id not in catalog:
+        suggestions = [
+            {"id": f.id, "name": f.name}
+            for f in find_features(feature_id)[:5]
+        ]
         return {
-            "ok": True,
-            "columns": columns,
-            "rows": [list(r) for r in rows],
-            "row_count": len(rows),
-            "truncated": truncated,
+            "ok": False,
+            "error": f"Unknown feature_id '{feature_id}'.",
+            "suggestions": suggestions,
         }
-    except sqlite3.OperationalError as exc:
-        return {"ok": False, "error": f"SQL error: {exc}"}
-    except sqlite3.DatabaseError as exc:
-        return {"ok": False, "error": f"Database error: {exc}"}
-    finally:
-        conn.close()
 
-
-def _has_multiple_statements(query: str) -> bool:
-    # Strip trailing whitespace and a single trailing semicolon, then
-    # if any other semicolons remain outside string literals, reject.
-    stripped = query.strip().rstrip(";").strip()
-    in_single = False
-    in_double = False
-    for ch in stripped:
-        if ch == "'" and not in_double:
-            in_single = not in_single
-        elif ch == '"' and not in_single:
-            in_double = not in_double
-        elif ch == ";" and not in_single and not in_double:
-            return True
-    return False
-
-
-def _install_timeout(conn: sqlite3.Connection, seconds: int) -> None:
-    import time
-
-    deadline = time.monotonic() + seconds
-
-    def _abort_if_overdue() -> int:
-        return 1 if time.monotonic() > deadline else 0
-
-    # progress handler is invoked every N opcodes; returning non-zero aborts.
-    conn.set_progress_handler(_abort_if_overdue, 1000)
+    feature = catalog[feature_id]
+    return {
+        "ok": True,
+        "feature": {
+            "id": feature.id,
+            "name": feature.name,
+            "description": feature.description,
+            "category": feature.category,
+            "suggested_chart": feature.suggested_chart,
+            "x_field": feature.x_field,
+            "y_field": feature.y_field,
+            "y_fields": list(feature.y_fields) if feature.y_fields else None,
+        },
+        "data": feature.data_columnar,
+        "row_count": feature.row_count,
+    }
 
 
 # ---------- make_chart ----------
 
-def make_chart(spec: dict, data: dict, turn) -> dict:
+def make_chart(
+    feature_id: str,
+    title: str,
+    spec_override: dict | None,
+    turn,
+) -> dict:
+    if not feature_id:
+        return {"ok": False, "error": "feature_id is required."}
+
     try:
-        figure = spec_to_figure(spec, data)
+        feature = load_features()[feature_id]
+    except KeyError:
+        suggestions = [
+            {"id": f.id, "name": f.name}
+            for f in find_features(feature_id)[:5]
+        ]
+        return {
+            "ok": False,
+            "error": f"Unknown feature_id '{feature_id}'.",
+            "suggestions": suggestions,
+        }
+
+    spec = build_default_spec(feature)
+    if spec_override:
+        spec.update(spec_override)
+    spec["title"] = title
+
+    try:
+        figure = spec_to_figure(spec, feature.data_columnar)
     except ChartSpecError as exc:
         return {"ok": False, "error": f"Chart spec invalid: {exc}"}
-    except Exception as exc:
-        return {"ok": False, "error": f"Chart build failed: {exc}"}
 
     chart_id = len(turn.charts)
-    turn.charts.append(figure)
-
-    # Also stage the underlying table so the UI can offer a "raw data" expander.
-    turn.tables.append(
-        {
-            "title": spec.get("title") or f"Chart {chart_id + 1} data",
-            "columns": data.get("columns", []),
-            "rows": data.get("rows", []),
-        }
+    turn.charts.append(
+        ChartMeta(
+            chart_id=chart_id,
+            name=title or feature.name,
+            feature_id=feature.id,
+            spec=spec,
+            figure=figure,
+        )
     )
+    return {"ok": True, "chart_id": chart_id, "title": title}
 
-    return {"ok": True, "chart_id": chart_id, "title": spec.get("title", "")}
+
+def build_default_spec(feature: Feature) -> dict:
+    spec: dict[str, Any] = {}
+    if feature.suggested_chart:
+        spec["type"] = feature.suggested_chart
+    if feature.x_field:
+        spec["x"] = feature.x_field
+    if feature.y_field:
+        spec["y"] = feature.y_field
+    if feature.y_fields:
+        spec["y_fields"] = list(feature.y_fields)
+    return spec
 
 
 # ---------- compute_stats ----------
@@ -226,15 +253,12 @@ def compute_stats(values: list, ops: list) -> dict:
         "p25": lambda a: float(np.percentile(a, 25)),
         "p75": lambda a: float(np.percentile(a, 75)),
     }
-
-    result: dict[str, Any] = {op: impl[op](arr) for op in ops}
-    return {"ok": True, "stats": result}
+    return {"ok": True, "stats": {op: impl[op](arr) for op in ops}}
 
 
-# ---------- helpers ----------
+# ---------- arg parser (kept from v1, used by client.py) ----------
 
 def parse_tool_arguments(raw: str | dict | None) -> dict:
-    """Azure OpenAI returns tool arguments as a JSON string. Parse defensively."""
     if raw is None:
         return {}
     if isinstance(raw, dict):

@@ -7,11 +7,16 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterator
 
-from openai import AzureOpenAI, APIError, RateLimitError, APITimeoutError, AuthenticationError
+from openai import (
+    APIError,
+    APITimeoutError,
+    AuthenticationError,
+    AzureOpenAI,
+    RateLimitError,
+)
 
 from agent.prompts import build_system_prompt
-from agent.tools import TOOLS, dispatch, parse_tool_arguments
-from datasets.base import Dataset
+from agent.tools import TOOLS, ChartMeta, dispatch, parse_tool_arguments
 
 
 logger = logging.getLogger(__name__)
@@ -23,8 +28,7 @@ RATE_LIMIT_RETRY_DELAY_SECONDS = 2
 @dataclass
 class AssistantTurn:
     text: str = ""
-    charts: list = field(default_factory=list)   # list of plotly Figures
-    tables: list[dict] = field(default_factory=list)
+    charts: list[ChartMeta] = field(default_factory=list)
     progress: list[str] = field(default_factory=list)
     truncated: bool = False
     error: str | None = None
@@ -32,13 +36,11 @@ class AssistantTurn:
 
 @dataclass
 class ProgressUpdate:
-    """Yielded by AnalyticsAgent.run_streaming so the UI can show activity."""
     label: str
 
 
 class AnalyticsAgent:
-    def __init__(self, dataset: Dataset) -> None:
-        self.dataset = dataset
+    def __init__(self) -> None:
         self.deployment = os.environ["AZURE_OPENAI_DEPLOYMENT"]
         self.client = AzureOpenAI(
             api_key=os.environ["AZURE_OPENAI_API_KEY"],
@@ -47,16 +49,11 @@ class AnalyticsAgent:
         )
 
     def system_prompt(self) -> str:
-        return build_system_prompt(
-            dataset_name=self.dataset.name,
-            dataset_description=self.dataset.description,
-            schema_summary=self.dataset.schema_summary(),
-        )
+        return build_system_prompt()
 
     def run_streaming(
         self, user_message: str, history: list[dict]
     ) -> Iterator[ProgressUpdate | AssistantTurn]:
-        """Run the agent loop, yielding progress updates and a final AssistantTurn."""
         turn = AssistantTurn()
         messages: list[dict] = [{"role": "system", "content": self.system_prompt()}]
         messages.extend(history)
@@ -77,17 +74,14 @@ class AnalyticsAgent:
             assistant_message = choice.message
 
             if assistant_message.tool_calls:
-                # The model wants to call tools. Append the assistant message,
-                # execute each call, append tool results, then loop.
                 messages.append(_assistant_message_dict(assistant_message))
-
                 for tc in assistant_message.tool_calls:
                     name = tc.function.name
                     args = parse_tool_arguments(tc.function.arguments)
                     yield ProgressUpdate(label=_progress_label(name))
 
                     logger.info("tool call: %s args_keys=%s", name, list(args.keys()))
-                    result = dispatch(name, args, self.dataset, turn)
+                    result = dispatch(name, args, turn)
                     logger.info(
                         "tool result: %s ok=%s",
                         name,
@@ -103,12 +97,10 @@ class AnalyticsAgent:
                     )
                 continue
 
-            # Final assistant turn (no tool calls).
             turn.text = assistant_message.content or ""
             yield turn
             return
 
-        # Loop cap hit.
         turn.truncated = True
         turn.text = (
             "I tried several approaches but couldn't fully resolve this. "
@@ -144,9 +136,7 @@ class AnalyticsAgent:
                 "Azure OpenAI authentication failed. Check AZURE_OPENAI_API_KEY in .env."
             ) from exc
         except APITimeoutError as exc:
-            raise _FriendlyAPIError(
-                "Azure OpenAI request timed out. Try again."
-            ) from exc
+            raise _FriendlyAPIError("Azure OpenAI request timed out. Try again.") from exc
         except APIError as exc:
             raise _FriendlyAPIError(f"Azure OpenAI error: {exc}") from exc
 
@@ -160,7 +150,6 @@ class _FriendlyAPIError(Exception):
 
 
 def _assistant_message_dict(msg) -> dict:
-    """Convert an OpenAI ChatCompletionMessage with tool_calls to a serializable dict."""
     return {
         "role": "assistant",
         "content": msg.content or "",
@@ -180,7 +169,7 @@ def _assistant_message_dict(msg) -> dict:
 
 def _progress_label(tool_name: str) -> str:
     return {
-        "run_sql": "Running SQL...",
+        "get_feature_data": "Fetching feature data...",
         "make_chart": "Building chart...",
         "compute_stats": "Computing statistics...",
     }.get(tool_name, f"Running {tool_name}...")
