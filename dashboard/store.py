@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -9,6 +8,8 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from agent.recipe import recipe_hash
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +20,7 @@ DEFAULT_PATH = "data/saved_charts.json"
 class SavedChart:
     id: str
     name: str
-    feature_id: str
-    spec: dict
+    recipe: dict
     created_at: str  # ISO-8601 UTC
 
 
@@ -32,7 +32,12 @@ def load_saved_charts(path: str = DEFAULT_PATH) -> list[SavedChart]:
         raw = json.loads(file_path.read_text(encoding="utf-8"))
         if not isinstance(raw, list):
             raise ValueError("saved_charts.json must be a list.")
-        return [SavedChart(**item) for item in raw]
+        out: list[SavedChart] = []
+        for item in raw:
+            if not isinstance(item, dict) or "recipe" not in item:
+                raise ValueError("Saved chart entry missing 'recipe' field (legacy schema).")
+            out.append(SavedChart(**item))
+        return out
     except (json.JSONDecodeError, ValueError, TypeError) as exc:
         backup = _backup_corrupt_file(file_path)
         logger.error(
@@ -42,24 +47,18 @@ def load_saved_charts(path: str = DEFAULT_PATH) -> list[SavedChart]:
         return []
 
 
-def save_chart(
-    name: str,
-    feature_id: str,
-    spec: dict,
-    path: str = DEFAULT_PATH,
-) -> SavedChart:
-    """Append a new saved chart. Dedupes by (feature_id, spec_hash)."""
+def save_chart(name: str, recipe: dict, path: str = DEFAULT_PATH) -> SavedChart:
+    """Append a new saved chart. Dedupes by recipe_hash."""
     existing = load_saved_charts(path)
-    fingerprint = (feature_id, _spec_hash(spec))
+    fingerprint = recipe_hash(recipe)
     for sc in existing:
-        if (sc.feature_id, _spec_hash(sc.spec)) == fingerprint:
+        if recipe_hash(sc.recipe) == fingerprint:
             return sc
 
     new = SavedChart(
         id=str(uuid.uuid4()),
         name=name,
-        feature_id=feature_id,
-        spec=spec,
+        recipe=recipe,
         created_at=datetime.now(timezone.utc).isoformat(),
     )
     existing.append(new)
@@ -90,20 +89,15 @@ def delete_chart(saved_id: str, path: str = DEFAULT_PATH) -> bool:
     return True
 
 
-def is_saved(feature_id: str, spec: dict, path: str = DEFAULT_PATH) -> bool:
-    fingerprint = (feature_id, _spec_hash(spec))
+def is_saved(recipe: dict, path: str = DEFAULT_PATH) -> bool:
+    fingerprint = recipe_hash(recipe)
     for sc in load_saved_charts(path):
-        if (sc.feature_id, _spec_hash(sc.spec)) == fingerprint:
+        if recipe_hash(sc.recipe) == fingerprint:
             return True
     return False
 
 
 # ---------- helpers ----------
-
-def _spec_hash(spec: dict) -> str:
-    canonical = json.dumps(spec, sort_keys=True, default=str)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
 
 def _atomic_write(charts: list[SavedChart], path: str) -> None:
     file_path = Path(path)
@@ -120,6 +114,5 @@ def _backup_corrupt_file(file_path: Path) -> Path:
     try:
         file_path.replace(backup)
     except OSError:
-        # If we can't rename, copy contents under the new name to preserve.
         backup.write_text(file_path.read_text(encoding="utf-8"), encoding="utf-8")
     return backup

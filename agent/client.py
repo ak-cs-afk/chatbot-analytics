@@ -30,6 +30,7 @@ class AssistantTurn:
     text: str = ""
     charts: list[ChartMeta] = field(default_factory=list)
     progress: list[str] = field(default_factory=list)
+    reasoning_steps: list[dict] = field(default_factory=list)
     truncated: bool = False
     error: str | None = None
 
@@ -82,10 +83,11 @@ class AnalyticsAgent:
 
                     logger.info("tool call: %s args_keys=%s", name, list(args.keys()))
                     result = dispatch(name, args, turn)
-                    logger.info(
-                        "tool result: %s ok=%s",
-                        name,
-                        result.get("ok") if isinstance(result, dict) else "?",
+                    ok = result.get("ok", False) if isinstance(result, dict) else False
+                    logger.info("tool result: %s ok=%s", name, ok)
+
+                    turn.reasoning_steps.append(
+                        _make_step(name, args, result, ok)
                     )
 
                     messages.append(
@@ -169,7 +171,52 @@ def _assistant_message_dict(msg) -> dict:
 
 def _progress_label(tool_name: str) -> str:
     return {
-        "get_feature_data": "Fetching feature data...",
-        "make_chart": "Building chart...",
-        "compute_stats": "Computing statistics...",
+        "peek_feature": "Inspecting feature schema...",
+        "analyze": "Running analysis...",
     }.get(tool_name, f"Running {tool_name}...")
+
+
+def _make_step(name: str, args: dict, result: dict, ok: bool) -> dict:
+    """Build a human-readable reasoning step from a tool call + its result."""
+    if name == "peek_feature":
+        fid = args.get("feature_id", "?")
+        if ok:
+            cols = [c["name"] for c in result.get("columns", [])]
+            detail = f"Found `{result.get('name', fid)}` with columns: {cols}"
+        else:
+            detail = result.get("error", "Unknown error")
+        return {"tool": "peek_feature", "label": f"Inspected `{fid}`", "ok": ok, "detail": detail}
+
+    if name == "analyze":
+        recipe = args.get("recipe", {})
+        sources = recipe.get("sources", [])
+        ops = recipe.get("ops", [])
+        op_types = [o.get("type", "?") for o in ops] if ops else []
+        if ok:
+            name_out = result.get("name", "chart")
+            recipe_text = result.get("recipe_text", "")
+            stats = result.get("stats", {})
+            stats_summary = ""
+            if stats:
+                first_col = next(iter(stats))
+                vals = stats[first_col]
+                stats_summary = "  Stats: " + ", ".join(
+                    f"{k}={v:.2f}" for k, v in vals.items()
+                )
+            detail = (
+                f"Recipe: sources={sources}, ops={op_types or 'none'}\n"
+                f"Result: {recipe_text}{stats_summary}"
+            )
+            label = f"Analyzed → `{name_out}`"
+        else:
+            detail = result.get("error", "Unknown error")
+            label = f"Analyze failed (sources={sources})"
+        return {"tool": "analyze", "label": label, "ok": ok, "detail": detail}
+
+    # Generic fallback for any future tools.
+    return {
+        "tool": name,
+        "label": f"Called `{name}`",
+        "ok": ok,
+        "detail": result.get("error", "") if not ok else "",
+    }

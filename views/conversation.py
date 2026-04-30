@@ -3,13 +3,13 @@ from __future__ import annotations
 import streamlit as st
 
 from agent.client import AnalyticsAgent, AssistantTurn, ProgressUpdate
+from agent.recipe import recipe_hash
 from agent.tools import ChartMeta
 from charts.chart_actions import render_chart_with_actions
 from dashboard.store import (
     DEFAULT_PATH as SAVED_CHARTS_PATH,
     load_saved_charts,
     save_chart,
-    _spec_hash,  # internal but stable - used for keying
 )
 
 
@@ -23,16 +23,16 @@ def _init_session_state() -> None:
     if "messages" not in st.session_state:
         # Each message: {"role", "text", "charts": list[ChartMeta]}
         st.session_state.messages = []
-    # Recompute saved keys from disk on first render.
     saved = load_saved_charts(SAVED_CHARTS_PATH)
-    st.session_state.saved_chart_keys = {
-        (sc.feature_id, _spec_hash(sc.spec)) for sc in saved
-    }
+    st.session_state.saved_chart_keys = {recipe_hash(sc.recipe) for sc in saved}
 
 
 def _render_history() -> None:
     for index, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
+            steps = msg.get("reasoning_steps") or []
+            if steps:
+                _render_reasoning_trace(steps)
             if msg.get("text"):
                 st.markdown(msg["text"])
             charts: list[ChartMeta] = msg.get("charts") or []
@@ -60,7 +60,7 @@ def _handle_input() -> None:
                     status.update(label=update.label)
                 else:
                     final_turn = update
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             status.update(label="Failed", state="error")
             st.error(f"Unexpected error: {exc}")
             return
@@ -74,6 +74,9 @@ def _handle_input() -> None:
             state="error" if final_turn.error else "complete",
         )
 
+        if final_turn.reasoning_steps:
+            _render_reasoning_trace(final_turn.reasoning_steps)
+
         if final_turn.text:
             st.markdown(final_turn.text)
 
@@ -81,8 +84,25 @@ def _handle_input() -> None:
         _render_chart_list(final_turn.charts, message_index=new_index)
 
     st.session_state.messages.append(
-        {"role": "assistant", "text": final_turn.text, "charts": final_turn.charts}
+        {
+            "role": "assistant",
+            "text": final_turn.text,
+            "charts": final_turn.charts,
+            "reasoning_steps": final_turn.reasoning_steps,
+        }
     )
+
+
+def _render_reasoning_trace(steps: list[dict]) -> None:
+    with st.expander("Reasoning trace", expanded=False):
+        for i, step in enumerate(steps):
+            ok = step.get("ok", True)
+            icon = "[ok]" if ok else "[fail]"
+            label = step.get("label", step.get("tool", "?"))
+            st.markdown(f"**{i + 1}. {icon} {label}**")
+            detail = step.get("detail", "")
+            if detail:
+                st.caption(detail)
 
 
 def _render_chart_list(charts: list[ChartMeta], message_index: int) -> None:
@@ -105,18 +125,13 @@ def _render_one(cm: ChartMeta, message_index: int) -> None:
         on_save=_on_save,
         on_rename=_on_rename,
         saved_keys=st.session_state.saved_chart_keys,
-        spec_hash_fn=_spec_hash,
+        recipe_hash_fn=recipe_hash,
     )
 
 
 def _on_save(cm: ChartMeta) -> None:
-    saved = save_chart(
-        name=cm.name,
-        feature_id=cm.feature_id,
-        spec=cm.spec,
-        path=SAVED_CHARTS_PATH,
-    )
-    st.session_state.saved_chart_keys.add((saved.feature_id, _spec_hash(saved.spec)))
+    saved = save_chart(name=cm.name, recipe=cm.recipe, path=SAVED_CHARTS_PATH)
+    st.session_state.saved_chart_keys.add(recipe_hash(saved.recipe))
     st.toast(f"Saved '{saved.name}' to Dashboard.")
 
 

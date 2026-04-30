@@ -4,19 +4,11 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
 import plotly.graph_objects as go
 
-from charts.renderer import ChartSpecError, spec_to_figure
-from features.catalog import find_features
-from features.loader import (
-    Feature,
-    FeatureNotFoundError,
-    load_features,
-)
-
-
-ALLOWED_STATS_OPS = {"min", "max", "mean", "median", "std", "sum", "count", "p25", "p75"}
+from agent.recipe import Recipe, RecipeValidationError
+from agent.recipe_executor import RecipeExecutionError, execute
+from features.loader import load_features
 
 
 # ---------- Public types ----------
@@ -25,9 +17,10 @@ ALLOWED_STATS_OPS = {"min", "max", "mean", "median", "std", "sum", "count", "p25
 class ChartMeta:
     chart_id: int
     name: str
-    feature_id: str
-    spec: dict
+    recipe: dict          # serialized form (Recipe.to_dict())
     figure: go.Figure
+    recipe_text: str
+    sources_used: list[dict] = field(default_factory=list)
 
 
 # ---------- Tool schemas (OpenAI function-calling format) ----------
@@ -36,17 +29,19 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "get_feature_data",
+            "name": "peek_feature",
             "description": (
-                "Fetch the data rows and chart hints for a single feature by its ID "
-                "(e.g. 'F001'). Returns columns, rows, and the suggested chart type/axes."
+                "Inspect one feature's schema and a few sample rows. Use this BEFORE writing "
+                "an analyze recipe so you reference real column names. Errors loudly if the "
+                "feature_id is unknown - if that happens, refuse the user's question rather "
+                "than guessing."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "feature_id": {
                         "type": "string",
-                        "description": "Feature ID like 'F001', 'F002', etc.",
+                        "description": "Feature ID from the catalog (e.g. 'mrr', 'F001').",
                     }
                 },
                 "required": ["feature_id"],
@@ -56,50 +51,30 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "make_chart",
+            "name": "analyze",
             "description": (
-                "Build a Plotly chart for a feature. Defaults to the feature's "
-                "suggested chart and axes; pass spec_override to swap chart type, "
-                "change axes, or add a color grouping. Always tied to a feature_id "
-                "so saved dashboards re-render from latest data."
+                "Execute a recipe against the features catalog and return a chart, stats, and "
+                "a data preview. The recipe is the persisted unit of work - it describes the "
+                "sources, the transformations, and (optionally) the chart spec. Direct charts "
+                "(one source, no ops) keep the feature's canonical name; derived charts "
+                "require an agent-authored chart.title."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "feature_id": {"type": "string"},
-                    "title": {
-                        "type": "string",
-                        "description": "Default name shown above the chart. Will be the chart's display name.",
-                    },
-                    "spec_override": {
+                    "recipe": {
                         "type": "object",
                         "description": (
-                            "Optional partial spec to override defaults. Keys: type "
-                            "(bar|line|scatter|pie|histogram|box|heatmap|funnel|"
-                            "grouped_bar|horizontal_bar), x, y, y_fields, color, "
-                            "names, values, z."
+                            "Recipe object. Shape: "
+                            "{sources:[feature_id,...], ops:[{type, ...}, ...], "
+                            "chart:{type, x, y, title, ...} (optional), "
+                            "stats:[mean|min|max|median|sum|count] (optional)}. "
+                            "Op types: filter, groupby, join, derive, sort, top_n, time_bucket, "
+                            "custom_python. See system prompt for examples."
                         ),
-                    },
+                    }
                 },
-                "required": ["feature_id", "title"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "compute_stats",
-            "description": (
-                "Compute descriptive statistics on a list of numeric values. "
-                "Allowed ops: min, max, mean, median, std, sum, count, p25, p75."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "values": {"type": "array", "items": {"type": "number"}},
-                    "ops": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["values", "ops"],
+                "required": ["recipe"],
             },
         },
     },
@@ -111,152 +86,108 @@ TOOLS: list[dict] = [
 def dispatch(name: str, args: dict, turn) -> dict:
     """Route a tool call. Returns a JSON-serializable dict."""
     try:
-        if name == "get_feature_data":
-            return get_feature_data(args.get("feature_id", ""))
-        if name == "make_chart":
-            return make_chart(
-                feature_id=args.get("feature_id", ""),
-                title=args.get("title", ""),
-                spec_override=args.get("spec_override"),
-                turn=turn,
-            )
-        if name == "compute_stats":
-            return compute_stats(args.get("values", []), args.get("ops", []))
+        if name == "peek_feature":
+            return peek_feature(args.get("feature_id", ""))
+        if name == "analyze":
+            return analyze(args.get("recipe"), turn)
         return {"ok": False, "error": f"Unknown tool: {name}"}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"Tool {name} crashed: {exc}"}
 
 
-# ---------- get_feature_data ----------
+# ---------- peek_feature ----------
 
-def get_feature_data(feature_id: str) -> dict:
+def peek_feature(feature_id: str) -> dict:
     if not feature_id:
         return {"ok": False, "error": "feature_id is required."}
     catalog = load_features()
     if feature_id not in catalog:
-        suggestions = [
-            {"id": f.id, "name": f.name}
-            for f in find_features(feature_id)[:5]
-        ]
         return {
             "ok": False,
-            "error": f"Unknown feature_id '{feature_id}'.",
-            "suggestions": suggestions,
+            "error": f"feature_id '{feature_id}' not found.",
+            "available": sorted(catalog.keys()),
         }
 
     feature = catalog[feature_id]
+    cols = feature.data_columnar["columns"]
+    rows = feature.data_columnar["rows"][:3]
+    sample = [{c: row[i] for i, c in enumerate(cols)} for row in rows]
+    columns = [{"name": c, "dtype": _infer_dtype(rows, i)} for i, c in enumerate(cols)]
+
     return {
         "ok": True,
-        "feature": {
-            "id": feature.id,
-            "name": feature.name,
-            "description": feature.description,
-            "category": feature.category,
-            "suggested_chart": feature.suggested_chart,
-            "x_field": feature.x_field,
-            "y_field": feature.y_field,
-            "y_fields": list(feature.y_fields) if feature.y_fields else None,
-        },
-        "data": feature.data_columnar,
+        "feature_id": feature.id,
+        "name": feature.name,
+        "description": feature.description,
+        "columns": columns,
+        "sample_rows": sample,
         "row_count": feature.row_count,
     }
 
 
-# ---------- make_chart ----------
+def _infer_dtype(rows: list, idx: int) -> str:
+    for row in rows:
+        v = row[idx]
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            return "bool"
+        if isinstance(v, int):
+            return "int"
+        if isinstance(v, float):
+            return "float"
+        return "str"
+    return "unknown"
 
-def make_chart(
-    feature_id: str,
-    title: str,
-    spec_override: dict | None,
-    turn,
-) -> dict:
-    if not feature_id:
-        return {"ok": False, "error": "feature_id is required."}
 
-    try:
-        feature = load_features()[feature_id]
-    except KeyError:
-        suggestions = [
-            {"id": f.id, "name": f.name}
-            for f in find_features(feature_id)[:5]
-        ]
-        return {
-            "ok": False,
-            "error": f"Unknown feature_id '{feature_id}'.",
-            "suggestions": suggestions,
-        }
+# ---------- analyze ----------
 
-    spec = build_default_spec(feature)
-    if spec_override:
-        spec.update(spec_override)
-    spec["title"] = title
+def analyze(recipe_dict: Any, turn) -> dict:
+    if not isinstance(recipe_dict, dict):
+        return {"ok": False, "error": "analyze.recipe must be an object."}
 
     try:
-        figure = spec_to_figure(spec, feature.data_columnar)
-    except ChartSpecError as exc:
-        return {"ok": False, "error": f"Chart spec invalid: {exc}"}
+        recipe = Recipe.from_dict(recipe_dict)
+    except RecipeValidationError as exc:
+        return {"ok": False, "error": f"Recipe validation failed: {exc}"}
+
+    catalog = load_features()
+    try:
+        result = execute(recipe, catalog)
+    except RecipeExecutionError as exc:
+        return {"ok": False, "error": str(exc)}
 
     chart_id = len(turn.charts)
-    turn.charts.append(
-        ChartMeta(
-            chart_id=chart_id,
-            name=title or feature.name,
-            feature_id=feature.id,
-            spec=spec,
-            figure=figure,
-        )
+    name = (
+        (recipe.chart or {}).get("title")
+        or (catalog[recipe.sources[0]].name if recipe.is_direct() else "Untitled chart")
     )
-    return {"ok": True, "chart_id": chart_id, "title": title}
 
+    if result.figure is not None:
+        turn.charts.append(
+            ChartMeta(
+                chart_id=chart_id,
+                name=name,
+                recipe=recipe.to_dict(),
+                figure=result.figure,
+                recipe_text=result.recipe_text,
+                sources_used=result.sources_used,
+            )
+        )
 
-def build_default_spec(feature: Feature) -> dict:
-    spec: dict[str, Any] = {}
-    if feature.suggested_chart:
-        spec["type"] = feature.suggested_chart
-    if feature.x_field:
-        spec["x"] = feature.x_field
-    if feature.y_field:
-        spec["y"] = feature.y_field
-    if feature.y_fields:
-        spec["y_fields"] = list(feature.y_fields)
-    return spec
-
-
-# ---------- compute_stats ----------
-
-def compute_stats(values: list, ops: list) -> dict:
-    if not isinstance(values, list) or not values:
-        return {"ok": False, "error": "'values' must be a non-empty list of numbers."}
-    if not isinstance(ops, list) or not ops:
-        return {"ok": False, "error": "'ops' must be a non-empty list of strings."}
-
-    bad_ops = [op for op in ops if op not in ALLOWED_STATS_OPS]
-    if bad_ops:
-        return {
-            "ok": False,
-            "error": f"Unknown ops: {bad_ops}. Allowed: {sorted(ALLOWED_STATS_OPS)}",
-        }
-
-    try:
-        arr = np.asarray(values, dtype=float)
-    except (TypeError, ValueError) as exc:
-        return {"ok": False, "error": f"Cannot convert values to numbers: {exc}"}
-
-    impl = {
-        "min": lambda a: float(np.min(a)),
-        "max": lambda a: float(np.max(a)),
-        "mean": lambda a: float(np.mean(a)),
-        "median": lambda a: float(np.median(a)),
-        "std": lambda a: float(np.std(a, ddof=1)) if a.size > 1 else 0.0,
-        "sum": lambda a: float(np.sum(a)),
-        "count": lambda a: int(a.size),
-        "p25": lambda a: float(np.percentile(a, 25)),
-        "p75": lambda a: float(np.percentile(a, 75)),
+    preview = result.df.head(5).to_dict(orient="records")
+    return {
+        "ok": True,
+        "chart_id": chart_id if result.figure is not None else None,
+        "name": name,
+        "data_preview": preview,
+        "stats": result.stats,
+        "recipe_text": result.recipe_text,
+        "sources_used": result.sources_used,
     }
-    return {"ok": True, "stats": {op: impl[op](arr) for op in ops}}
 
 
-# ---------- arg parser (kept from v1, used by client.py) ----------
+# ---------- Argument parser (kept from v1, used by client.py) ----------
 
 def parse_tool_arguments(raw: str | dict | None) -> dict:
     if raw is None:
