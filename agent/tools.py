@@ -89,7 +89,12 @@ def dispatch(name: str, args: dict, turn) -> dict:
         if name == "peek_feature":
             return peek_feature(args.get("feature_id", ""))
         if name == "analyze":
-            return analyze(args.get("recipe"), turn)
+            # The model sometimes passes recipe fields directly at the top level
+            # instead of nested under a "recipe" key. Accept both forms.
+            recipe_dict = args.get("recipe")
+            if not isinstance(recipe_dict, dict):
+                recipe_dict = args
+            return analyze(recipe_dict, turn)
         return {"ok": False, "error": f"Unknown tool: {name}"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"Tool {name} crashed: {exc}"}

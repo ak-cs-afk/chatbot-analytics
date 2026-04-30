@@ -188,7 +188,8 @@ def _make_step(name: str, args: dict, result: dict, ok: bool) -> dict:
         return {"tool": "peek_feature", "label": f"Inspected `{fid}`", "ok": ok, "detail": detail}
 
     if name == "analyze":
-        recipe = args.get("recipe", {})
+        # Mirror dispatch: accept recipe nested or flat at top level.
+        recipe = args.get("recipe") if isinstance(args.get("recipe"), dict) else args
         sources = recipe.get("sources", [])
         ops = recipe.get("ops", [])
         op_types = [o.get("type", "?") for o in ops] if ops else []
