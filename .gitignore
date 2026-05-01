@@ -9,4 +9,4 @@ __pycache__/
 *.egg-info/
 data/olist.db
 data/saved_charts.json
-data/saved_charts.corrupt-*.json
+data/saved_charts.corrupt-*.json.worktrees/
