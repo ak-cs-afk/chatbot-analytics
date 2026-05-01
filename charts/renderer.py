@@ -4,164 +4,245 @@ import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
 
+from charts.chart_view import (
+    ALL_TYPES,
+    AxisHints,
+    ChartView,
+    MULTI_MEASURE_TYPES,
+    SINGLE_MEASURE_TYPES,
+    GROUPED_TYPES,
+)
 
-ALLOWED_TYPES = {
-    "bar",
-    "line",
-    "scatter",
-    "pie",
-    "histogram",
-    "box",
-    "heatmap",
-    "funnel",
-    "grouped_bar",
-    "horizontal_bar",
-}
+
+ALLOWED_TYPES = ALL_TYPES  # back-compat re-export for any consumers
 
 
 class ChartSpecError(ValueError):
-    """Raised when a chart spec is invalid."""
+    """Raised when a chart spec is invalid for the given data."""
 
 
-def spec_to_figure(spec: dict, data: dict) -> go.Figure:
-    """Build a Plotly figure from a chart spec and a {columns, rows} data dict."""
-    chart_type = spec.get("type")
-    if chart_type not in ALLOWED_TYPES:
+PALETTE = px.colors.qualitative.Set2
+
+
+# ---------- Public entry ----------
+
+def render(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
+    if view.type not in ALL_TYPES:
         raise ChartSpecError(
-            f"Unsupported chart type '{chart_type}'. Allowed: {sorted(ALLOWED_TYPES)}"
+            f"Unsupported chart type '{view.type}'. Allowed: {sorted(ALL_TYPES)}"
         )
 
-    df = _to_dataframe(data)
-    title = spec.get("title", "")
-
-    if chart_type == "bar":
-        _require(spec, ["x", "y"])
-        _check_columns(df, [spec["x"], spec["y"]] + _opt(spec, "color"))
-        fig = px.bar(df, x=spec["x"], y=spec["y"], color=spec.get("color"), title=title)
-
-    elif chart_type == "line":
-        _require(spec, ["x", "y"])
-        _check_columns(df, [spec["x"], spec["y"]] + _opt(spec, "color"))
-        fig = px.line(df, x=spec["x"], y=spec["y"], color=spec.get("color"), title=title)
-
-    elif chart_type == "scatter":
-        _require(spec, ["x", "y"])
-        _check_columns(df, [spec["x"], spec["y"]] + _opt(spec, "color"))
-        fig = px.scatter(df, x=spec["x"], y=spec["y"], color=spec.get("color"), title=title)
-
-    elif chart_type == "pie":
-        _require(spec, ["names", "values"])
-        _check_columns(df, [spec["names"], spec["values"]])
-        fig = px.pie(df, names=spec["names"], values=spec["values"], title=title)
-
-    elif chart_type == "histogram":
-        _require(spec, ["x"])
-        _check_columns(df, [spec["x"]] + _opt(spec, "color"))
-        fig = px.histogram(df, x=spec["x"], color=spec.get("color"), title=title)
-
-    elif chart_type == "box":
-        _require(spec, ["y"])
-        cols = [spec["y"]] + _opt(spec, "x") + _opt(spec, "color")
-        _check_columns(df, cols)
-        fig = px.box(df, y=spec["y"], x=spec.get("x"), color=spec.get("color"), title=title)
-
-    elif chart_type == "heatmap":
-        _require(spec, ["x", "y", "z"])
-        _check_columns(df, [spec["x"], spec["y"], spec["z"]])
-        pivot = df.pivot_table(index=spec["y"], columns=spec["x"], values=spec["z"])
-        fig = go.Figure(
-            data=go.Heatmap(z=pivot.values, x=list(pivot.columns), y=list(pivot.index))
-        )
-        if title:
-            fig.update_layout(title=title)
-
-    elif chart_type == "funnel":
-        _require(spec, ["x", "y"])
-        # x = stage label column, y = numeric value column
-        _check_columns(df, [spec["x"], spec["y"]])
-        fig = go.Figure(go.Funnel(x=df[spec["y"]], y=df[spec["x"]]))
-        if title:
-            fig.update_layout(title=title)
-
-    elif chart_type == "grouped_bar":
-        # spec.y_fields = list of numeric columns to group; x is the categorical axis.
-        _require(spec, ["x", "y_fields"])
-        y_fields = spec["y_fields"]
-        if not isinstance(y_fields, list) or not y_fields:
-            raise ChartSpecError("grouped_bar requires non-empty y_fields list.")
-        _check_columns(df, [spec["x"], *y_fields])
-        long_df = df.melt(
-            id_vars=[spec["x"]],
-            value_vars=y_fields,
-            var_name="series",
-            value_name="value",
-        )
-        fig = px.bar(
-            long_df,
-            x=spec["x"],
-            y="value",
-            color="series",
-            barmode="group",
-            title=title,
+    # Validate columns referenced by the view exist in df.
+    referenced = [view.x, *view.y]
+    if view.color:
+        referenced.append(view.color)
+    missing = [c for c in referenced if c not in df.columns]
+    if missing:
+        raise ChartSpecError(
+            f"Columns {missing} not in result data. Available: {list(df.columns)}"
         )
 
-    elif chart_type == "horizontal_bar":
-        _require(spec, ["x", "y"])
-        _check_columns(df, [spec["x"], spec["y"]] + _opt(spec, "color"))
-        # x is the numeric axis (length), y is the category axis. Sort descending by x.
-        sorted_df = df.sort_values(by=spec["x"], ascending=True)
-        fig = px.bar(
-            sorted_df,
-            x=spec["x"],
-            y=spec["y"],
-            color=spec.get("color"),
-            orientation="h",
-            title=title,
+    if view.type in MULTI_MEASURE_TYPES:
+        return _render_multi_measure(view, df, hints)
+    if view.type in GROUPED_TYPES:
+        return _render_grouped_bar(view, df, hints)
+    if view.type == "horizontal_bar":
+        return _render_horizontal_bar(view, df, hints)
+    return _render_single_measure(view, df, hints)
+
+
+# ---------- Multi-measure (line / bar / scatter) ----------
+
+def _render_multi_measure(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
+    fig = go.Figure()
+    if view.color and len(view.y) == 1:
+        return _render_single_color_grouped(view, df, hints)
+
+    # Determine each Y series' unit so we know which axis to assign.
+    from charts.chart_view import _resolve_unit  # type: ignore
+
+    units = []  # We can't import the feature_columns here; rely on hints semantics.
+    # The hints already encode left/right unit. We classify each Y by unit equality.
+    # Resolve units from view.column_units (overrides) only; the renderer trusts
+    # hints for the axis decision and treats remaining columns as left.
+    for col in view.y:
+        units.append(view.column_units.get(col))
+
+    for i, col in enumerate(view.y):
+        # If the explicit override matches the right unit -> right axis.
+        # Otherwise: if there's a right axis and we have N=2 measures, second goes right.
+        secondary = (
+            hints.right_y_unit is not None
+            and units[i] == hints.right_y_unit
         )
+        if hints.right_y_unit is not None and not any(units):
+            secondary = (i == 1)  # fall back to "second measure goes right" when overrides absent
 
-    else:
-        raise ChartSpecError(f"Unhandled chart type {chart_type}")
+        color = PALETTE[i % len(PALETTE)]
+        trace_kwargs = dict(
+            x=df[view.x],
+            y=df[col],
+            name=col,
+        )
+        if view.type == "line":
+            fig.add_trace(go.Scatter(
+                mode="lines+markers",
+                marker=dict(color=color),
+                line=dict(color=color),
+                yaxis="y2" if secondary else "y",
+                **trace_kwargs,
+            ))
+        elif view.type == "bar":
+            fig.add_trace(go.Bar(
+                marker=dict(color=color),
+                yaxis="y2" if secondary else "y",
+                **trace_kwargs,
+            ))
+        elif view.type == "scatter":
+            fig.add_trace(go.Scatter(
+                mode="markers",
+                marker=dict(color=color),
+                yaxis="y2" if secondary else "y",
+                **trace_kwargs,
+            ))
 
-    _apply_executive_theme(fig, df.columns.tolist())
+    layout = dict(
+        title=view.title,
+        template="plotly_white",
+        margin=dict(l=40, r=40, t=50, b=40),
+        xaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),
+        yaxis=_axis_layout(hints.left_y_unit, hints.left_y_label),
+    )
+    if hints.right_y_unit is not None:
+        layout["yaxis2"] = _axis_layout(
+            hints.right_y_unit,
+            hints.right_y_label or "",
+            side="right",
+            overlaying="y",
+        )
+    fig.update_layout(**layout)
     return fig
 
 
-# ---------- helpers ----------
-
-def _to_dataframe(data: dict) -> pd.DataFrame:
-    if not isinstance(data, dict) or "columns" not in data or "rows" not in data:
-        raise ChartSpecError("Chart data must be a dict with 'columns' and 'rows' keys.")
-    return pd.DataFrame(data["rows"], columns=data["columns"])
-
-
-def _require(spec: dict, keys: list[str]) -> None:
-    missing = [k for k in keys if k not in spec or spec[k] is None]
-    if missing:
-        raise ChartSpecError(f"Chart spec missing required keys: {missing}")
-
-
-def _opt(spec: dict, key: str) -> list[str]:
-    return [spec[key]] if spec.get(key) else []
-
-
-def _check_columns(df: pd.DataFrame, cols: list[str]) -> None:
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        raise ChartSpecError(
-            f"Columns {missing} not in data. Available: {list(df.columns)}"
-        )
-
-
-def _apply_executive_theme(fig: go.Figure, columns: list[str]) -> None:
+def _render_single_color_grouped(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
+    # Single Y measure with a color column: use plotly.express for the convenience.
+    y_col = view.y[0]
+    if view.type == "line":
+        fig = px.line(df, x=view.x, y=y_col, color=view.color, title=view.title)
+    elif view.type == "bar":
+        fig = px.bar(df, x=view.x, y=y_col, color=view.color, title=view.title)
+    elif view.type == "scatter":
+        fig = px.scatter(df, x=view.x, y=y_col, color=view.color, title=view.title)
+    else:
+        raise ChartSpecError(f"Color grouping not supported for type '{view.type}'.")
     fig.update_layout(
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
+        xaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),
+        yaxis=_axis_layout(hints.left_y_unit, hints.left_y_label),
     )
-    has_usd = any(c.endswith("_usd") for c in columns)
-    has_pct = any(c.endswith("_pct") for c in columns)
-    if has_usd:
-        fig.update_yaxes(tickprefix="$", separatethousands=True)
-    if has_pct:
-        # Apply percent formatting to y-axis only when no usd column overrides it.
-        if not has_usd:
-            fig.update_yaxes(ticksuffix="%")
+    return fig
+
+
+# ---------- Single-measure types ----------
+
+def _render_single_measure(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
+    y = view.y[0]
+    if view.type == "pie":
+        fig = px.pie(df, names=view.x, values=y, title=view.title)
+    elif view.type == "histogram":
+        fig = px.histogram(df, x=view.x, color=view.color, title=view.title)
+    elif view.type == "box":
+        fig = px.box(df, y=y, x=view.x, color=view.color, title=view.title)
+    elif view.type == "heatmap":
+        if view.color is None:
+            raise ChartSpecError("heatmap requires color (z) field via view.color.")
+        pivot = df.pivot_table(index=y, columns=view.x, values=view.color)
+        fig = go.Figure(
+            data=go.Heatmap(z=pivot.values, x=list(pivot.columns), y=list(pivot.index))
+        )
+        fig.update_layout(title=view.title)
+    elif view.type == "funnel":
+        fig = go.Figure(go.Funnel(x=df[y], y=df[view.x]))
+        fig.update_layout(title=view.title)
+    else:
+        raise ChartSpecError(f"Unhandled single-measure type: {view.type}")
+
+    fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    if view.type in {"box", "histogram"}:
+        fig.update_layout(
+            xaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),
+            yaxis=_axis_layout(hints.left_y_unit, hints.left_y_label),
+        )
+    return fig
+
+
+# ---------- Grouped bar ----------
+
+def _render_grouped_bar(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
+    if not view.y or len(view.y) < 2:
+        raise ChartSpecError("grouped_bar requires 2+ Y measures.")
+    long_df = df.melt(
+        id_vars=[view.x],
+        value_vars=view.y,
+        var_name="series",
+        value_name="value",
+    )
+    fig = px.bar(
+        long_df,
+        x=view.x,
+        y="value",
+        color="series",
+        barmode="group",
+        title=view.title,
+    )
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+        xaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),
+        yaxis=_axis_layout(hints.left_y_unit, hints.left_y_label),
+    )
+    return fig
+
+
+# ---------- Horizontal bar ----------
+
+def _render_horizontal_bar(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
+    y = view.y[0]
+    sorted_df = df.sort_values(by=y, ascending=True)
+    fig = px.bar(
+        sorted_df,
+        x=y,
+        y=view.x,
+        color=view.color,
+        orientation="h",
+        title=view.title,
+    )
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+        xaxis=_axis_layout(hints.left_y_unit, hints.left_y_label or y),  # numeric on x
+        yaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),       # categories on y
+    )
+    return fig
+
+
+# ---------- Axis layout helper ----------
+
+def _axis_layout(unit: str, label: str, **extra) -> dict:
+    base: dict = {"title": label, **extra}
+    if unit == "usd":
+        base["tickprefix"] = "$"
+        base["separatethousands"] = True
+    elif unit == "pct":
+        base["ticksuffix"] = "%"
+    elif unit == "count":
+        base["separatethousands"] = True
+    elif unit == "hours":
+        base["ticksuffix"] = "h"
+    elif unit == "days":
+        base["ticksuffix"] = "d"
+    elif unit == "date":
+        base["type"] = "date"
+    # number / string -> no formatter
+    return base

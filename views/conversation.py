@@ -7,6 +7,7 @@ from agent.recipe import recipe_hash
 from agent.tools import AnalysisCard, ChartMeta
 from charts.analysis_card import render_analysis_card
 from charts.chart_actions import render_chart_with_actions
+from charts.chart_view import ChartView
 from dashboard.store import (
     DEFAULT_PATH as SAVED_CHARTS_PATH,
     load_saved_charts,
@@ -22,7 +23,6 @@ def render() -> None:
 
 def _init_session_state() -> None:
     if "messages" not in st.session_state:
-        # Each message: {"role", "text", "charts", "analysis_cards", "reasoning_steps"}
         st.session_state.messages = []
     saved = load_saved_charts(SAVED_CHARTS_PATH)
     st.session_state.saved_chart_keys = {recipe_hash(sc.recipe) for sc in saved}
@@ -35,7 +35,7 @@ def _render_history() -> None:
             if steps:
                 _render_reasoning_trace(steps)
             if msg.get("text"):
-                st.markdown(msg["text"])
+                _safe_markdown(msg["text"])
             _render_analysis_and_charts(
                 analysis_cards=msg.get("analysis_cards") or [],
                 charts=msg.get("charts") or [],
@@ -82,9 +82,8 @@ def _handle_input() -> None:
 
         if final_turn.reasoning_steps:
             _render_reasoning_trace(final_turn.reasoning_steps)
-
         if final_turn.text:
-            st.markdown(final_turn.text)
+            _safe_markdown(final_turn.text)
 
         new_index = len(st.session_state.messages)
         _render_analysis_and_charts(
@@ -104,6 +103,11 @@ def _handle_input() -> None:
     )
 
 
+def _safe_markdown(text: str) -> None:
+    """Render LLM text, escaping $ to prevent Streamlit LaTeX math-mode."""
+    st.markdown(text.replace("$", r"\$"))
+
+
 def _render_reasoning_trace(steps: list[dict]) -> None:
     with st.expander("Reasoning trace", expanded=False):
         for i, step in enumerate(steps):
@@ -121,13 +125,12 @@ def _render_analysis_and_charts(
     charts: list[ChartMeta],
     message_index: int,
 ) -> None:
-    """Render analysis cards (with their bundled source charts) first, then standalone direct charts."""
     chart_by_id = {cm.chart_id: cm for cm in charts}
     chart_ids_in_cards: set[int] = set()
     for card in analysis_cards:
         chart_ids_in_cards.update(card.source_chart_ids)
         source_charts = [chart_by_id[cid] for cid in card.source_chart_ids if cid in chart_by_id]
-        render_analysis_card(card, source_charts, message_index)
+        render_analysis_card(card, source_charts, message_index, on_save_source=_on_save_chart)
 
     standalone = [cm for cm in charts if cm.chart_id not in chart_ids_in_cards and cm.mode == "direct"]
     if not standalone:
@@ -147,16 +150,21 @@ def _render_one(cm: ChartMeta, message_index: int) -> None:
     render_chart_with_actions(
         chart_meta=cm,
         message_index=message_index,
-        on_save=_on_save,
+        on_save=_on_save_chart,
         on_rename=_on_rename,
         saved_keys=st.session_state.saved_chart_keys,
-        recipe_hash_fn=recipe_hash,
     )
 
 
-def _on_save(cm: ChartMeta) -> None:
-    saved = save_chart(name=cm.name, recipe=cm.recipe, path=SAVED_CHARTS_PATH)
+def _on_save_chart(cm: ChartMeta, view: ChartView) -> None:
+    saved = save_chart(
+        name=view.title,
+        recipe=cm.recipe,
+        chart_view=view.to_dict(),
+        path=SAVED_CHARTS_PATH,
+    )
     st.session_state.saved_chart_keys.add(recipe_hash(saved.recipe))
+    cm.saved_id = saved.id
     st.toast(f"Saved '{saved.name}' to Dashboard.")
 
 

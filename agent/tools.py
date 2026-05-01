@@ -4,10 +4,9 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import plotly.graph_objects as go
-
 from agent.recipe import Recipe, RecipeValidationError
 from agent.recipe_executor import RecipeExecutionError, execute
+from charts.chart_view import ChartView, default_chart_view
 from features.loader import load_features
 
 
@@ -18,12 +17,12 @@ class ChartMeta:
     chart_id: int
     name: str
     recipe: dict
-    figure: go.Figure
+    chart_view: dict     # serialized ChartView
     recipe_text: str
     sources_used: list[dict] = field(default_factory=list)
     mode: Literal["direct", "derived_source"] = "direct"
-    data_columnar: dict | None = None  # populated for derived_source charts
-
+    data_columnar: dict | None = None  # populated for all charts (direct + derived_source)
+    saved_id: str | None = None        # populated when this chart is loaded from a saved entry
 
 @dataclass
 class AnalysisCard:
@@ -188,25 +187,29 @@ def _emit_direct(recipe: Recipe, result, turn, catalog: dict) -> dict:
     name = feature.name
     chart_id = len(turn.charts)
 
-    if result.figure is not None:
-        turn.charts.append(
-            ChartMeta(
-                chart_id=chart_id,
-                name=name,
-                recipe=recipe.to_dict(),
-                figure=result.figure,
-                recipe_text=result.recipe_text,
-                sources_used=result.sources_used,
-                mode="direct",
-                data_columnar=feature.data_columnar,
-            )
+    try:
+        view = default_chart_view(feature, recipe_chart=recipe.chart)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"Could not build chart_view: {exc}"}
+
+    turn.charts.append(
+        ChartMeta(
+            chart_id=chart_id,
+            name=name,
+            recipe=recipe.to_dict(),
+            chart_view=view.to_dict(),
+            recipe_text=result.recipe_text,
+            sources_used=result.sources_used,
+            mode="direct",
+            data_columnar=feature.data_columnar,
         )
+    )
 
     preview = result.df.head(5).to_dict(orient="records")
     return {
         "ok": True,
         "mode": "direct",
-        "chart_id": chart_id if result.figure is not None else None,
+        "chart_id": chart_id,
         "name": name,
         "data_preview": preview,
         "stats": result.stats,
@@ -216,24 +219,35 @@ def _emit_direct(recipe: Recipe, result, turn, catalog: dict) -> dict:
 
 
 def _emit_derived(recipe: Recipe, result, turn) -> dict:
-    # One ChartMeta per source feature, marked as derived_source (no Save button).
+    catalog = load_features()
     source_chart_ids: list[int] = []
     source_charts_payload: list[dict] = []
+
     for src in result.sources_used:
+        feature = catalog[src["id"]]
         chart_id = len(turn.charts)
-        figure = result.source_figures.get(src["id"])
-        if figure is None:
+        try:
+            view = default_chart_view(feature, recipe_chart=None)
+        except Exception as exc:  # noqa: BLE001
+            # Skip this source if we can't build a default view.
             continue
         feature_columnar = {
             "columns": list(result.source_dataframes[src["id"]].columns),
             "rows": result.source_dataframes[src["id"]].values.tolist(),
         }
+        # Synthesize a "direct" recipe that the user could save standalone if they edit.
+        synth_recipe = {
+            "sources": [src["id"]],
+            "ops": [],
+            "chart": view.to_dict(),  # editor edits chart_view, recipe just records the chart for hash
+            "stats": [],
+        }
         turn.charts.append(
             ChartMeta(
                 chart_id=chart_id,
                 name=src["name"],
-                recipe=recipe.to_dict(),  # shared with the analysis card
-                figure=figure,
+                recipe=synth_recipe,
+                chart_view=view.to_dict(),
                 recipe_text=result.recipe_text,
                 sources_used=result.sources_used,
                 mode="derived_source",

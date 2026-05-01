@@ -21,7 +21,9 @@ class SavedChart:
     id: str
     name: str
     recipe: dict
-    created_at: str  # ISO-8601 UTC
+    chart_view: dict
+    created_at: str   # ISO-8601 UTC
+    updated_at: str   # ISO-8601 UTC
 
 
 def load_saved_charts(path: str = DEFAULT_PATH) -> list[SavedChart]:
@@ -34,8 +36,13 @@ def load_saved_charts(path: str = DEFAULT_PATH) -> list[SavedChart]:
             raise ValueError("saved_charts.json must be a list.")
         out: list[SavedChart] = []
         for item in raw:
-            if not isinstance(item, dict) or "recipe" not in item:
-                raise ValueError("Saved chart entry missing 'recipe' field (legacy schema).")
+            if not isinstance(item, dict):
+                raise ValueError("Saved chart entry must be an object.")
+            for required in ("id", "name", "recipe", "chart_view", "created_at"):
+                if required not in item:
+                    raise ValueError(f"Saved chart entry missing '{required}'.")
+            if "updated_at" not in item:
+                item["updated_at"] = item["created_at"]
             out.append(SavedChart(**item))
         return out
     except (json.JSONDecodeError, ValueError, TypeError) as exc:
@@ -47,31 +54,58 @@ def load_saved_charts(path: str = DEFAULT_PATH) -> list[SavedChart]:
         return []
 
 
-def save_chart(name: str, recipe: dict, path: str = DEFAULT_PATH) -> SavedChart:
-    """Append a new saved chart. Dedupes by recipe_hash."""
+def save_chart(name: str, recipe: dict, chart_view: dict, path: str = DEFAULT_PATH) -> SavedChart:
+    """Insert or update a saved chart by recipe_hash."""
     existing = load_saved_charts(path)
     fingerprint = recipe_hash(recipe)
+    now = datetime.now(timezone.utc).isoformat()
     for sc in existing:
         if recipe_hash(sc.recipe) == fingerprint:
+            sc.name = name
+            sc.chart_view = chart_view
+            sc.updated_at = now
+            _atomic_write(existing, path)
             return sc
 
     new = SavedChart(
         id=str(uuid.uuid4()),
         name=name,
         recipe=recipe,
-        created_at=datetime.now(timezone.utc).isoformat(),
+        chart_view=chart_view,
+        created_at=now,
+        updated_at=now,
     )
     existing.append(new)
     _atomic_write(existing, path)
     return new
 
 
+def update_chart_view(saved_id: str, chart_view: dict, path: str = DEFAULT_PATH) -> SavedChart | None:
+    existing = load_saved_charts(path)
+    target = None
+    now = datetime.now(timezone.utc).isoformat()
+    for sc in existing:
+        if sc.id == saved_id:
+            sc.chart_view = chart_view
+            sc.name = chart_view.get("title", sc.name)
+            sc.updated_at = now
+            target = sc
+            break
+    if target is None:
+        return None
+    _atomic_write(existing, path)
+    return target
+
+
 def rename_chart(saved_id: str, new_name: str, path: str = DEFAULT_PATH) -> SavedChart | None:
     existing = load_saved_charts(path)
     target = None
+    now = datetime.now(timezone.utc).isoformat()
     for sc in existing:
         if sc.id == saved_id:
             sc.name = new_name
+            sc.chart_view["title"] = new_name
+            sc.updated_at = now
             target = sc
             break
     if target is None:

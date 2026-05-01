@@ -21,7 +21,7 @@ from agent.recipe import (
     TopNOp,
 )
 from agent.sandbox import run_user_code, SandboxError
-from charts.renderer import ChartSpecError, spec_to_figure
+from charts.renderer import ChartSpecError
 from features.loader import Feature
 
 
@@ -33,15 +33,12 @@ class RecipeExecutionError(RuntimeError):
 class ExecutionResult:
     df: pd.DataFrame
     mode: str   # "direct" or "derived"
-    figure: go.Figure | None
     stats: dict[str, dict[str, float]]
     recipe_text: str
     sources_used: list[dict]
-    # Derived-mode extras (empty/None for direct):
+    # Derived-mode extras (empty for direct):
     source_dataframes: dict[str, pd.DataFrame] = field(default_factory=dict)
-    source_figures: dict[str, go.Figure] = field(default_factory=dict)
     methodology_steps: list[dict] = field(default_factory=list)
-
 
 # ---------- Public entry ----------
 
@@ -81,23 +78,11 @@ def _build_direct_result(
     df: pd.DataFrame,
     sources_used: list[dict],
 ) -> ExecutionResult:
-    figure: go.Figure | None = None
-    if recipe.chart is not None:
-        chart_spec = dict(recipe.chart)
-        # Naming policy: direct charts use the feature's canonical name.
-        chart_spec["title"] = features[recipe.sources[0]].name
-        try:
-            figure = spec_to_figure(chart_spec, _df_to_columnar(df))
-        except ChartSpecError as exc:
-            raise RecipeExecutionError(f"Chart spec invalid: {exc}") from exc
-
     stats = _compute_stats(df, recipe.stats)
     recipe_text = f"Direct view of {sources_used[0]['name']}."
-
     return ExecutionResult(
         df=df,
         mode="direct",
-        figure=figure,
         stats=stats,
         recipe_text=recipe_text,
         sources_used=sources_used,
@@ -111,18 +96,10 @@ def _build_derived_result(
     sources_used: list[dict],
     execution_trace: list[dict],
 ) -> ExecutionResult:
-    # Auto-build a canonical chart for each source feature (ignore recipe.chart).
     source_dfs: dict[str, pd.DataFrame] = {}
-    source_figs: dict[str, go.Figure] = {}
     for src in sources_used:
         feature = features[src["id"]]
         source_dfs[src["id"]] = _feature_to_df(feature)
-        try:
-            source_figs[src["id"]] = _build_canonical_chart(feature)
-        except ChartSpecError as exc:
-            raise RecipeExecutionError(
-                f"Could not build canonical chart for {src['id']} ({src['name']}): {exc}"
-            ) from exc
 
     stats = _compute_stats(df, recipe.stats)
     methodology_steps = _generate_methodology_steps(recipe, sources_used, execution_trace, df, stats)
@@ -131,31 +108,12 @@ def _build_derived_result(
     return ExecutionResult(
         df=df,
         mode="derived",
-        figure=None,
         stats=stats,
         recipe_text=recipe_text,
         sources_used=sources_used,
         source_dataframes=source_dfs,
-        source_figures=source_figs,
         methodology_steps=methodology_steps,
     )
-
-
-def _build_canonical_chart(feature: Feature) -> go.Figure:
-    """Build a chart for a feature using its catalog hints."""
-    spec: dict[str, Any] = {"title": feature.name}
-    if feature.suggested_chart:
-        spec["type"] = feature.suggested_chart
-    else:
-        # Reasonable fallback: bar if there's a categorical x and one numeric y.
-        spec["type"] = "bar"
-    if feature.x_field:
-        spec["x"] = feature.x_field
-    if feature.y_field:
-        spec["y"] = feature.y_field
-    if feature.y_fields:
-        spec["y_fields"] = list(feature.y_fields)
-    return spec_to_figure(spec, feature.data_columnar)
 
 
 # ---------- Op dispatch ----------
