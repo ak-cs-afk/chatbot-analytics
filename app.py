@@ -36,41 +36,6 @@ def main() -> None:
         page_icon=":bar_chart:",
         layout="wide",
     )
-    st.markdown(
-        """
-        <style>
-          /* Pin the Streamlit chat input to the bottom of the viewport.
-             Use a transparent backdrop with blur so it adapts to whatever
-             theme Streamlit is running (light or dark) without hardcoding
-             colors that fight the theme. */
-          [data-testid="stChatInput"] {
-              position: fixed;
-              bottom: 0;
-              left: 0;
-              right: 0;
-              padding: 0.75rem 1rem 1rem 1rem;
-              background-color: transparent;
-              backdrop-filter: blur(10px) saturate(140%);
-              -webkit-backdrop-filter: blur(10px) saturate(140%);
-              border-top: 1px solid rgba(128, 128, 128, 0.15);
-              z-index: 999;
-          }
-          /* Reserve space at the bottom of the main scroll area so the last
-             message isn't hidden behind the pinned input. */
-          section[data-testid="stMain"] .block-container {
-              padding-bottom: 9rem;
-          }
-          /* Account for the sidebar on desktop so the pinned input doesn't
-             overlap it. */
-          @media (min-width: 768px) {
-              [data-testid="stChatInput"] {
-                  left: var(--sidebar-width, 21rem);
-              }
-          }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
     st.title("Chatbot Analytics")
     st.caption("Chat with your business metrics. Save charts to a persistent dashboard.")
 
@@ -81,10 +46,10 @@ def main() -> None:
 
     _render_sidebar()
 
-    tab_conv, tab_dash = st.tabs(["Conversation", "Dashboard"])
-    with tab_conv:
+    active = st.session_state.get("active_view", "Conversation")
+    if active == "Conversation":
         conversation.render()
-    with tab_dash:
+    else:
         dashboard.render()
 
 
@@ -113,6 +78,14 @@ def _check_features() -> bool:
 
 def _render_sidebar() -> None:
     with st.sidebar:
+        st.radio(
+            "View",
+            options=["Conversation", "Dashboard"],
+            index=0,
+            key="active_view",
+        )
+        st.divider()
+
         st.header("Settings")
         st.text_input(
             "Deployment",
@@ -132,7 +105,7 @@ def _render_sidebar() -> None:
             st.rerun()
 
         st.divider()
-        st.caption("v2 - features-catalog mode")
+        st.caption("v3 - recipe-based")
 
 
 if __name__ == "__main__":

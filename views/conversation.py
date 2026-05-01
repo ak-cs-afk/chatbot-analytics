@@ -4,7 +4,8 @@ import streamlit as st
 
 from agent.client import AnalyticsAgent, AssistantTurn, ProgressUpdate
 from agent.recipe import recipe_hash
-from agent.tools import ChartMeta
+from agent.tools import AnalysisCard, ChartMeta
+from charts.analysis_card import render_analysis_card
 from charts.chart_actions import render_chart_with_actions
 from dashboard.store import (
     DEFAULT_PATH as SAVED_CHARTS_PATH,
@@ -21,7 +22,7 @@ def render() -> None:
 
 def _init_session_state() -> None:
     if "messages" not in st.session_state:
-        # Each message: {"role", "text", "charts": list[ChartMeta]}
+        # Each message: {"role", "text", "charts", "analysis_cards", "reasoning_steps"}
         st.session_state.messages = []
     saved = load_saved_charts(SAVED_CHARTS_PATH)
     st.session_state.saved_chart_keys = {recipe_hash(sc.recipe) for sc in saved}
@@ -35,8 +36,11 @@ def _render_history() -> None:
                 _render_reasoning_trace(steps)
             if msg.get("text"):
                 st.markdown(msg["text"])
-            charts: list[ChartMeta] = msg.get("charts") or []
-            _render_chart_list(charts, message_index=index)
+            _render_analysis_and_charts(
+                analysis_cards=msg.get("analysis_cards") or [],
+                charts=msg.get("charts") or [],
+                message_index=index,
+            )
 
 
 def _handle_input() -> None:
@@ -44,7 +48,9 @@ def _handle_input() -> None:
     if not user_input:
         return
 
-    st.session_state.messages.append({"role": "user", "text": user_input, "charts": []})
+    st.session_state.messages.append(
+        {"role": "user", "text": user_input, "charts": [], "analysis_cards": []}
+    )
     with st.chat_message("user"):
         st.markdown(user_input)
 
@@ -81,13 +87,18 @@ def _handle_input() -> None:
             st.markdown(final_turn.text)
 
         new_index = len(st.session_state.messages)
-        _render_chart_list(final_turn.charts, message_index=new_index)
+        _render_analysis_and_charts(
+            analysis_cards=final_turn.analysis_cards,
+            charts=final_turn.charts,
+            message_index=new_index,
+        )
 
     st.session_state.messages.append(
         {
             "role": "assistant",
             "text": final_turn.text,
             "charts": final_turn.charts,
+            "analysis_cards": final_turn.analysis_cards,
             "reasoning_steps": final_turn.reasoning_steps,
         }
     )
@@ -105,16 +116,30 @@ def _render_reasoning_trace(steps: list[dict]) -> None:
                 st.caption(detail)
 
 
-def _render_chart_list(charts: list[ChartMeta], message_index: int) -> None:
-    if not charts:
+def _render_analysis_and_charts(
+    analysis_cards: list[AnalysisCard],
+    charts: list[ChartMeta],
+    message_index: int,
+) -> None:
+    """Render analysis cards (with their bundled source charts) first, then standalone direct charts."""
+    chart_by_id = {cm.chart_id: cm for cm in charts}
+    chart_ids_in_cards: set[int] = set()
+    for card in analysis_cards:
+        chart_ids_in_cards.update(card.source_chart_ids)
+        source_charts = [chart_by_id[cid] for cid in card.source_chart_ids if cid in chart_by_id]
+        render_analysis_card(card, source_charts, message_index)
+
+    standalone = [cm for cm in charts if cm.chart_id not in chart_ids_in_cards and cm.mode == "direct"]
+    if not standalone:
         return
-    if len(charts) >= 3:
+
+    if len(standalone) >= 3:
         cols = st.columns(2)
-        for i, cm in enumerate(charts):
+        for i, cm in enumerate(standalone):
             with cols[i % 2]:
                 _render_one(cm, message_index)
     else:
-        for cm in charts:
+        for cm in standalone:
             _render_one(cm, message_index)
 
 

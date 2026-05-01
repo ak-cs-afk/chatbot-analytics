@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 from typing import Callable
 
 import streamlit as st
 
 from agent.tools import ChartMeta
+from charts.source_data import render_raw_data_expander
 
 
 def render_chart_with_actions(
@@ -16,22 +16,23 @@ def render_chart_with_actions(
     saved_keys: set[str],
     recipe_hash_fn: Callable[[dict], str],
 ) -> None:
-    """Render a chart with its action toolbar inside a Streamlit container.
+    """Render a SAVABLE direct chart card.
 
-    Args:
-        chart_meta: The chart to render.
-        message_index: Position of this turn in the message history (used for unique keys).
-        on_save: Callback invoked when user clicks Save to Dashboard.
-        on_rename: Callback invoked when user edits the name field.
-        saved_keys: Set of recipe_hash strings already in the dashboard.
-        recipe_hash_fn: Function that turns a recipe dict into a stable hash string.
+    Source charts under derived analyses are rendered by charts/analysis_card.py
+    and never reach this function.
     """
+    if chart_meta.mode != "direct":
+        st.warning(
+            f"render_chart_with_actions called with non-direct chart "
+            f"(mode={chart_meta.mode!r}). This is a bug; please report."
+        )
+        return
+
     container = st.container(border=True)
     with container:
         name_key = f"chart_name_{message_index}_{chart_meta.chart_id}"
         save_key = f"chart_save_{message_index}_{chart_meta.chart_id}"
         chart_key = f"chart_fig_{message_index}_{chart_meta.chart_id}"
-        expand_key = f"chart_explain_{message_index}_{chart_meta.chart_id}"
 
         new_name = st.text_input(
             "Chart name",
@@ -44,14 +45,20 @@ def render_chart_with_actions(
 
         st.plotly_chart(chart_meta.figure, use_container_width=True, key=chart_key)
 
-        with st.expander("How this was calculated", expanded=False):
-            if chart_meta.sources_used:
-                st.markdown("**Sources:**")
-                for src in chart_meta.sources_used:
-                    st.markdown(f"- `{src['id']}` - {src['name']}")
-            st.markdown(f"**Method:** {chart_meta.recipe_text}")
-            st.markdown("**Recipe:**")
-            st.code(json.dumps(chart_meta.recipe, indent=2), language="json")
+        # Methodology line: simple for direct charts (no transformations).
+        if chart_meta.sources_used:
+            src = chart_meta.sources_used[0]
+            row_count = len(chart_meta.data_columnar["rows"]) if chart_meta.data_columnar else "?"
+            st.caption(
+                f"**Source:** `{src['id']}` ({src['name']}) - "
+                f"{row_count} rows. Direct view (no transformations)."
+            )
+
+        render_raw_data_expander(
+            data_columnar=chart_meta.data_columnar,
+            name=chart_meta.name,
+            key_suffix=f"direct_{message_index}_{chart_meta.chart_id}",
+        )
 
         already_saved = recipe_hash_fn(chart_meta.recipe) in saved_keys
         cols = st.columns([4, 1])

@@ -16,7 +16,7 @@ from openai import (
 )
 
 from agent.prompts import build_system_prompt
-from agent.tools import TOOLS, ChartMeta, dispatch, parse_tool_arguments
+from agent.tools import TOOLS, AnalysisCard, ChartMeta, dispatch, parse_tool_arguments
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ class AssistantTurn:
     charts: list[ChartMeta] = field(default_factory=list)
     progress: list[str] = field(default_factory=list)
     reasoning_steps: list[dict] = field(default_factory=list)
+    analysis_cards: list[AnalysisCard] = field(default_factory=list)
     truncated: bool = False
     error: str | None = None
 
@@ -188,33 +189,35 @@ def _make_step(name: str, args: dict, result: dict, ok: bool) -> dict:
         return {"tool": "peek_feature", "label": f"Inspected `{fid}`", "ok": ok, "detail": detail}
 
     if name == "analyze":
-        # Mirror dispatch: accept recipe nested or flat at top level.
         recipe = args.get("recipe") if isinstance(args.get("recipe"), dict) else args
-        sources = recipe.get("sources", [])
-        ops = recipe.get("ops", [])
+        sources = recipe.get("sources", []) if isinstance(recipe, dict) else []
+        ops = recipe.get("ops", []) if isinstance(recipe, dict) else []
         op_types = [o.get("type", "?") for o in ops] if ops else []
         if ok:
-            name_out = result.get("name", "chart")
-            recipe_text = result.get("recipe_text", "")
-            stats = result.get("stats", {})
-            stats_summary = ""
-            if stats:
-                first_col = next(iter(stats))
-                vals = stats[first_col]
-                stats_summary = "  Stats: " + ", ".join(
-                    f"{k}={v:.2f}" for k, v in vals.items()
+            mode = result.get("mode", "?")
+            if mode == "direct":
+                name_out = result.get("name", "chart")
+                detail = (
+                    f"Mode: direct. Recipe: sources={sources}, ops=none.\n"
+                    f"Result: chart `{name_out}`."
                 )
-            detail = (
-                f"Recipe: sources={sources}, ops={op_types or 'none'}\n"
-                f"Result: {recipe_text}{stats_summary}"
-            )
-            label = f"Analyzed → `{name_out}`"
+                label = f"Analyzed (direct) -> `{name_out}`"
+            elif mode == "derived":
+                src_count = len(result.get("sources_used", []))
+                step_count = len(result.get("methodology_steps", []))
+                detail = (
+                    f"Mode: derived. Sources: {sources}. Ops: {op_types}.\n"
+                    f"Generated {step_count} methodology step(s) across {src_count} source chart(s)."
+                )
+                label = f"Analyzed (derived, {src_count} sources)"
+            else:
+                detail = f"Recipe: sources={sources}, ops={op_types or 'none'}"
+                label = "Analyzed"
         else:
             detail = result.get("error", "Unknown error")
             label = f"Analyze failed (sources={sources})"
         return {"tool": "analyze", "label": label, "ok": ok, "detail": detail}
 
-    # Generic fallback for any future tools.
     return {
         "tool": name,
         "label": f"Called `{name}`",

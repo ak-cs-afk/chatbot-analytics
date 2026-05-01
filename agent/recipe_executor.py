@@ -1,8 +1,7 @@
-# agent/recipe_executor.py
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -20,7 +19,6 @@ from agent.recipe import (
     SortOp,
     TimeBucketOp,
     TopNOp,
-    ALLOWED_DERIVE_FUNCS,
 )
 from agent.sandbox import run_user_code, SandboxError
 from charts.renderer import ChartSpecError, spec_to_figure
@@ -34,10 +32,15 @@ class RecipeExecutionError(RuntimeError):
 @dataclass
 class ExecutionResult:
     df: pd.DataFrame
+    mode: str   # "direct" or "derived"
     figure: go.Figure | None
     stats: dict[str, dict[str, float]]
     recipe_text: str
-    sources_used: list[dict]   # [{"id": ..., "name": ...}, ...]
+    sources_used: list[dict]
+    # Derived-mode extras (empty/None for direct):
+    source_dataframes: dict[str, pd.DataFrame] = field(default_factory=dict)
+    source_figures: dict[str, go.Figure] = field(default_factory=dict)
+    methodology_steps: list[dict] = field(default_factory=list)
 
 
 # ---------- Public entry ----------
@@ -51,6 +54,8 @@ def execute(recipe: Recipe, features: dict[str, Feature]) -> ExecutionResult:
 
     df = _feature_to_df(features[recipe.sources[0]])
 
+    # Build a row-count trace as ops execute, so we can describe what each op did.
+    execution_trace: list[dict] = [{"op": None, "rows_after": len(df)}]
     for idx, op in enumerate(recipe.ops):
         try:
             df = _apply_op(op, df, features)
@@ -60,24 +65,97 @@ def execute(recipe: Recipe, features: dict[str, Feature]) -> ExecutionResult:
             raise RecipeExecutionError(
                 f"Op #{idx + 1} ({op.type}) failed: {type(exc).__name__}: {exc}"
             ) from exc
+        execution_trace.append({"op": op, "rows_after": len(df), "columns_after": list(df.columns)})
 
+    if recipe.is_direct():
+        return _build_direct_result(recipe, features, df, sources_used)
+
+    return _build_derived_result(recipe, features, df, sources_used, execution_trace)
+
+
+# ---------- Result builders ----------
+
+def _build_direct_result(
+    recipe: Recipe,
+    features: dict[str, Feature],
+    df: pd.DataFrame,
+    sources_used: list[dict],
+) -> ExecutionResult:
     figure: go.Figure | None = None
     if recipe.chart is not None:
         chart_spec = dict(recipe.chart)
-        if recipe.is_direct():
-            # Naming policy: direct charts use the feature's canonical name.
-            chart_spec["title"] = features[recipe.sources[0]].name
+        # Naming policy: direct charts use the feature's canonical name.
+        chart_spec["title"] = features[recipe.sources[0]].name
         try:
             figure = spec_to_figure(chart_spec, _df_to_columnar(df))
         except ChartSpecError as exc:
             raise RecipeExecutionError(f"Chart spec invalid: {exc}") from exc
 
     stats = _compute_stats(df, recipe.stats)
-    recipe_text = _humanize(recipe, sources_used)
+    recipe_text = f"Direct view of {sources_used[0]['name']}."
 
     return ExecutionResult(
-        df=df, figure=figure, stats=stats, recipe_text=recipe_text, sources_used=sources_used
+        df=df,
+        mode="direct",
+        figure=figure,
+        stats=stats,
+        recipe_text=recipe_text,
+        sources_used=sources_used,
     )
+
+
+def _build_derived_result(
+    recipe: Recipe,
+    features: dict[str, Feature],
+    df: pd.DataFrame,
+    sources_used: list[dict],
+    execution_trace: list[dict],
+) -> ExecutionResult:
+    # Auto-build a canonical chart for each source feature (ignore recipe.chart).
+    source_dfs: dict[str, pd.DataFrame] = {}
+    source_figs: dict[str, go.Figure] = {}
+    for src in sources_used:
+        feature = features[src["id"]]
+        source_dfs[src["id"]] = _feature_to_df(feature)
+        try:
+            source_figs[src["id"]] = _build_canonical_chart(feature)
+        except ChartSpecError as exc:
+            raise RecipeExecutionError(
+                f"Could not build canonical chart for {src['id']} ({src['name']}): {exc}"
+            ) from exc
+
+    stats = _compute_stats(df, recipe.stats)
+    methodology_steps = _generate_methodology_steps(recipe, sources_used, execution_trace, df, stats)
+    recipe_text = _humanize_derived(recipe, sources_used)
+
+    return ExecutionResult(
+        df=df,
+        mode="derived",
+        figure=None,
+        stats=stats,
+        recipe_text=recipe_text,
+        sources_used=sources_used,
+        source_dataframes=source_dfs,
+        source_figures=source_figs,
+        methodology_steps=methodology_steps,
+    )
+
+
+def _build_canonical_chart(feature: Feature) -> go.Figure:
+    """Build a chart for a feature using its catalog hints."""
+    spec: dict[str, Any] = {"title": feature.name}
+    if feature.suggested_chart:
+        spec["type"] = feature.suggested_chart
+    else:
+        # Reasonable fallback: bar if there's a categorical x and one numeric y.
+        spec["type"] = "bar"
+    if feature.x_field:
+        spec["x"] = feature.x_field
+    if feature.y_field:
+        spec["y"] = feature.y_field
+    if feature.y_fields:
+        spec["y_fields"] = list(feature.y_fields)
+    return spec_to_figure(spec, feature.data_columnar)
 
 
 # ---------- Op dispatch ----------
@@ -231,34 +309,105 @@ def _compute_stats(df: pd.DataFrame, stats: list[str]) -> dict[str, dict[str, fl
     return out
 
 
-# ---------- Human-readable recipe text ----------
+# ---------- Methodology generation ----------
 
-def _humanize(recipe: Recipe, sources_used: list[dict]) -> str:
-    if recipe.is_direct():
-        return f"Direct view of {sources_used[0]['name']}."
-    src_names = ", ".join(s["name"] for s in sources_used)
-    parts = [f"Sources: {src_names}."]
-    for op in recipe.ops:
-        parts.append(_humanize_op(op))
-    return " ".join(parts)
+def _generate_methodology_steps(
+    recipe: Recipe,
+    sources_used: list[dict],
+    trace: list[dict],
+    final_df: pd.DataFrame,
+    stats: dict[str, dict[str, float]],
+) -> list[dict]:
+    """Emit a structured list of [{step: int, text: str}] describing each op + the result."""
+    steps: list[dict] = []
+    step_no = 1
+
+    if len(sources_used) == 1:
+        starter = (
+            f"Started from `{sources_used[0]['id']}` "
+            f"({sources_used[0]['name']}) - {trace[0]['rows_after']} rows."
+        )
+    else:
+        first = sources_used[0]
+        starter = (
+            f"Started from `{first['id']}` ({first['name']}) - {trace[0]['rows_after']} rows. "
+            f"Will combine with {len(sources_used) - 1} other source(s) below."
+        )
+    steps.append({"step": step_no, "text": starter})
+    step_no += 1
+
+    for trace_entry in trace[1:]:
+        op = trace_entry["op"]
+        rows = trace_entry["rows_after"]
+        text = _describe_op(op, rows)
+        steps.append({"step": step_no, "text": text})
+        step_no += 1
+
+    if stats:
+        flat = []
+        for col, col_stats in stats.items():
+            for stat_name, value in col_stats.items():
+                if isinstance(value, float):
+                    flat.append(f"{col}.{stat_name}={value:.4g}")
+                else:
+                    flat.append(f"{col}.{stat_name}={value}")
+        if flat:
+            steps.append({
+                "step": step_no,
+                "text": f"Computed stats: {', '.join(flat)}.",
+            })
+            step_no += 1
+
+    return steps
 
 
-def _humanize_op(op: Op) -> str:
+def _describe_op(op: Op, rows_after: int) -> str:
     if isinstance(op, FilterOp):
-        return f"Filter where {op.column} {op.op} {op.value!r}."
+        return f"Filter where `{op.column} {op.op} {op.value!r}` -> {rows_after} rows."
     if isinstance(op, GroupbyOp):
-        agg_text = ", ".join(f"{c}:{fn}" for c, fn in op.agg.items())
-        return f"Group by {', '.join(op.by)} aggregating {agg_text}."
+        agg_text = ", ".join(f"`{c}`:{fn}" for c, fn in op.agg.items())
+        return (
+            f"Group by {', '.join(f'`{c}`' for c in op.by)} aggregating {agg_text} "
+            f"-> {rows_after} groups."
+        )
     if isinstance(op, JoinOp):
-        return f"Join with {op.with_} on {', '.join(op.on)} ({op.how})."
+        return (
+            f"Joined with `{op.with_}` on {', '.join(f'`{c}`' for c in op.on)} "
+            f"({op.how} join) -> {rows_after} rows matched."
+        )
     if isinstance(op, DeriveOp):
-        return f"Derive {op.name} = {op.expr}."
+        return f"Derived new column `{op.name}` = `{op.expr}` ({rows_after} rows)."
     if isinstance(op, SortOp):
-        return f"Sort by {op.by} {op.order}."
+        return f"Sorted by `{op.by}` {op.order}."
     if isinstance(op, TopNOp):
-        return f"Keep top {op.n} by {op.by}."
+        return f"Kept top {op.n} rows by `{op.by}`."
     if isinstance(op, TimeBucketOp):
-        return f"Bucket {op.column} to {op.freq}-period start."
+        return f"Bucketed `{op.column}` to {op.freq}-period start."
     if isinstance(op, CustomPythonOp):
-        return f"Custom transformation ({len(op.code)} chars of Python)."
-    return ""
+        return f"Custom Python transformation ({len(op.code)} chars) -> {rows_after} rows."
+    return f"Unknown op -> {rows_after} rows."
+
+
+def _humanize_derived(recipe: Recipe, sources_used: list[dict]) -> str:
+    src_names = ", ".join(s["name"] for s in sources_used)
+    op_summaries = []
+    for op in recipe.ops:
+        if isinstance(op, JoinOp):
+            op_summaries.append(f"joined with {op.with_}")
+        elif isinstance(op, DeriveOp):
+            op_summaries.append(f"derived {op.name}")
+        elif isinstance(op, GroupbyOp):
+            op_summaries.append(f"grouped by {', '.join(op.by)}")
+        elif isinstance(op, FilterOp):
+            op_summaries.append(f"filtered on {op.column}")
+        elif isinstance(op, TopNOp):
+            op_summaries.append(f"kept top {op.n} by {op.by}")
+        elif isinstance(op, SortOp):
+            op_summaries.append(f"sorted by {op.by}")
+        elif isinstance(op, TimeBucketOp):
+            op_summaries.append(f"bucketed {op.column} to {op.freq}")
+        elif isinstance(op, CustomPythonOp):
+            op_summaries.append("ran a custom Python transformation")
+    if op_summaries:
+        return f"Sources: {src_names}. Steps: {', '.join(op_summaries)}."
+    return f"Sources: {src_names}."
