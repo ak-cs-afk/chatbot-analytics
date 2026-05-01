@@ -944,14 +944,18 @@
   {
     "feature_id": "F011",
     "feature_name": "Net Revenue Retention (NRR)",
-    "feature_description": "Monthly NRR with expansion, contraction, and churn MRR broken out",
+    "feature_description": "Monthly MRR waterfall: starting MRR, expansion, contraction, churn, and ending MRR with Net Revenue Retention (NRR) rate",
     "category": "Retention",
     "tags": [
       "nrr",
       "net revenue retention",
-      "expansion",
-      "churn",
-      "contraction"
+      "mrr waterfall",
+      "mrr bridge",
+      "expansion mrr",
+      "churn mrr",
+      "contraction mrr",
+      "starting mrr",
+      "ending mrr"
     ],
     "suggested_chart": "line",
     "x_field": "month",

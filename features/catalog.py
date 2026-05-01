@@ -19,9 +19,11 @@ def build_catalog_text(path: str | None = None) -> str:
 
         tags = ", ".join(feature.tags) if feature.tags else "(none)"
 
+        col_names = ", ".join(feature.columns.keys()) if feature.columns else "unknown"
         lines.append(
             f"{feature.id} - {feature.name} ({feature.category})\n"
             f"   {feature.description}\n"
+            f"   Columns: {col_names}.\n"
             f"   Tags: {tags}. Suggested chart: {suggested} ({axes})."
         )
     return "\n\n".join(lines)
