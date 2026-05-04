@@ -8,7 +8,6 @@ import streamlit as st
 from charts.chart_view import (
     ALL_TYPES,
     ALLOWED_FILTER_OPS,
-    ALLOWED_UNITS,
     SINGLE_MEASURE_TYPES,
     ChartView,
     ChartViewError,
@@ -17,6 +16,13 @@ from charts.chart_view import (
     default_chart_view,
 )
 from charts.renderer import ChartSpecError, render as render_figure
+from charts.units import (
+    CURRENCY_UNITS,
+    FORMAT_LABELS,
+    currency_label,
+    format_to_unit,
+    unit_to_format,
+)
 from features.loader import ColumnMeta, Feature
 
 
@@ -30,11 +36,16 @@ def render_chart_editor(
 ) -> ChartView:
     """Render editor controls. Returns the updated chart_view (live)."""
 
-    # Title
     title = st.text_input(
         "Title",
         value=chart_view.title,
         key=f"{key_prefix}_title",
+    )
+    subtitle = st.text_input(
+        "Subtitle",
+        value=chart_view.subtitle,
+        placeholder="Optional short description",
+        key=f"{key_prefix}_subtitle",
     )
 
     type_col, x_col = st.columns(2)
@@ -46,7 +57,6 @@ def render_chart_editor(
             key=f"{key_prefix}_type",
         )
     with x_col:
-        # X options: dimension columns; for scatter type also allow measures.
         x_options = [
             c for c, m in feature_columns.items()
             if m.kind == "dimension" or ctype == "scatter"
@@ -56,7 +66,6 @@ def render_chart_editor(
         x_idx = x_options.index(chart_view.x) if chart_view.x in x_options else 0
         x = st.selectbox("X axis", options=x_options, index=x_idx, key=f"{key_prefix}_x")
 
-    # Y picker - multi-select for multi-measure types, selectbox for single-measure-only.
     measure_options = [c for c, m in feature_columns.items() if m.kind == "measure"]
     if not measure_options:
         measure_options = list(feature_columns.keys())
@@ -84,7 +93,6 @@ def render_chart_editor(
             st.warning("At least one Y measure is required; reverting.")
             y = default_y
 
-    # Color (single-measure only)
     color: str | None = None
     if len(y) == 1:
         dimension_options = ["(none)"] + [c for c, m in feature_columns.items() if m.kind == "dimension"]
@@ -98,7 +106,31 @@ def render_chart_editor(
         )
         color = None if color_choice == "(none)" else color_choice
 
-    # Column display labels
+    # Sort by + direction
+    sort_options = ["(none)"] + list(df.columns)
+    cur_sort = chart_view.sort_by or "(none)"
+    sort_idx = sort_options.index(cur_sort) if cur_sort in sort_options else 0
+    sort_col, dir_col = st.columns(2)
+    with sort_col:
+        sort_choice = st.selectbox(
+            "Sort by",
+            options=sort_options,
+            index=sort_idx,
+            key=f"{key_prefix}_sort_by",
+        )
+        sort_by_val = None if sort_choice == "(none)" else sort_choice
+    with dir_col:
+        dir_options = ["Desc", "Asc"]
+        cur_dir = "Asc" if chart_view.sort_dir == "asc" else "Desc"
+        dir_idx = dir_options.index(cur_dir)
+        dir_choice = st.selectbox(
+            "Direction",
+            options=dir_options,
+            index=dir_idx,
+            key=f"{key_prefix}_sort_dir",
+        )
+        sort_dir_val = "asc" if dir_choice == "Asc" else "desc"
+
     referenced_cols = [x] + y
     st.markdown("**Column display labels**")
     column_labels: dict[str, str] = {}
@@ -113,28 +145,40 @@ def render_chart_editor(
         if new_label.strip():
             column_labels[col] = new_label.strip()
 
-    # Column unit overrides (Y columns only)
-    st.markdown("**Column units**")
+    st.markdown("**Column format**")
     column_units: dict[str, str] = {}
+    currency_codes = sorted(CURRENCY_UNITS)
     for col in y:
         default_unit = (
             chart_view.column_units.get(col)
             or (feature_columns[col].unit if col in feature_columns else "number")
         )
-        unit_options = sorted(ALLOWED_UNITS)
-        unit_idx = unit_options.index(default_unit) if default_unit in unit_options else 0
-        chosen = st.selectbox(
-            f"Unit for `{col}`",
-            options=unit_options,
-            index=unit_idx,
-            key=f"{key_prefix}_unit_{col}",
+        current_fmt, current_cur = unit_to_format(default_unit)
+
+        fmt = st.selectbox(
+            f"Format for `{col}`",
+            options=FORMAT_LABELS,
+            index=FORMAT_LABELS.index(current_fmt),
+            key=f"{key_prefix}_fmt_{col}",
         )
-        # Only persist as override if it differs from the feature default.
+        if fmt == "Currency":
+            default_currency = current_cur if current_cur in CURRENCY_UNITS else "usd"
+            cur_idx = currency_codes.index(default_currency)
+            currency_choice = st.selectbox(
+                f"Currency for `{col}`",
+                options=currency_codes,
+                index=cur_idx,
+                format_func=currency_label,
+                key=f"{key_prefix}_cur_{col}",
+            )
+            chosen = format_to_unit(fmt, currency_choice)
+        else:
+            chosen = format_to_unit(fmt)
+
         feature_default = feature_columns[col].unit if col in feature_columns else None
         if chosen != feature_default:
             column_units[col] = chosen
 
-    # Filters
     st.markdown("**Filters (post-execution, AND'd)**")
     filters = _render_filters(chart_view.filters, df, key_prefix)
 
@@ -147,7 +191,23 @@ def render_chart_editor(
         column_labels=column_labels,
         column_units=column_units,
         filters=filters,
+        subtitle=subtitle,
+        sort_by=sort_by_val,
+        sort_dir=sort_dir_val,
     )
+
+
+def _add_filter_callback(state_key: str, default_column: str) -> None:
+    current = list(st.session_state.get(state_key, []))
+    current.append({"column": default_column, "op": "==", "value": ""})
+    st.session_state[state_key] = current
+
+
+def _remove_filter_callback(state_key: str, index: int) -> None:
+    current = list(st.session_state.get(state_key, []))
+    if 0 <= index < len(current):
+        current.pop(index)
+        st.session_state[state_key] = current
 
 
 def _render_filters(
@@ -159,11 +219,28 @@ def _render_filters(
     if state_key not in st.session_state:
         st.session_state[state_key] = [f.to_dict() for f in existing]
 
-    new_state: list[dict] = []
     column_options = list(df.columns)
-    removed = False
+    default_column = column_options[0] if column_options else ""
 
-    for i, flt in enumerate(st.session_state[state_key]):
+    # Add button first; uses on_click so state mutates BEFORE the rerun (no
+    # st.rerun() needed, which would otherwise dismiss the parent dialog).
+    st.button(
+        "+ Add filter",
+        key=f"{key_prefix}_filt_add",
+        on_click=_add_filter_callback,
+        args=(state_key, default_column),
+    )
+
+    new_state: list[dict] = []
+
+    filters_list = list(st.session_state[state_key])
+    if filters_list:
+        hdr = st.columns([2, 1, 2, 0.5])
+        hdr[0].caption("Column")
+        hdr[1].caption("Op")
+        hdr[2].caption("Value")
+
+    for i, flt in enumerate(filters_list):
         cols = st.columns([2, 1, 2, 0.5])
         with cols[0]:
             col_idx = column_options.index(flt["column"]) if flt.get("column") in column_options else 0
@@ -172,6 +249,7 @@ def _render_filters(
                 options=column_options,
                 index=col_idx,
                 key=f"{key_prefix}_filt_col_{i}",
+                label_visibility="collapsed",
             )
         with cols[1]:
             op_options = sorted(ALLOWED_FILTER_OPS)
@@ -197,20 +275,16 @@ def _render_filters(
             )
             value: Any = _parse_filter_value(val_str, op)
         with cols[3]:
-            if st.button("x", key=f"{key_prefix}_filt_rm_{i}"):
-                removed = True
-                continue  # skip this filter; effectively removes it
+            st.button(
+                "x",
+                key=f"{key_prefix}_filt_rm_{i}",
+                on_click=_remove_filter_callback,
+                args=(state_key, i),
+            )
 
         new_state.append({"column": col, "op": op, "value": value})
 
     st.session_state[state_key] = new_state
-    if removed:
-        st.rerun()
-
-    if st.button("+ Add filter", key=f"{key_prefix}_filt_add"):
-        new_state.append({"column": column_options[0] if column_options else "", "op": "==", "value": ""})
-        st.session_state[state_key] = new_state
-        st.rerun()
 
     # Convert to ChartViewFilter, skipping invalid rows.
     out: list[ChartViewFilter] = []
@@ -273,6 +347,18 @@ def open_chart_editor_dialog(
         st.error("Chart view not found in session. Close and reopen the editor.")
         return
 
+    # Each time the edit button is pressed, the caller increments this counter.
+    # Using the generation in every widget key guarantees Streamlit treats all
+    # widgets as new (initialises from index=/value=) rather than restoring
+    # whatever the user typed in the previous unsaved session.
+    gen = st.session_state.get(f"{key_prefix}_dlg_gen", 0)
+    editor_key_prefix = f"dlg_{key_prefix}_g{gen}"
+
+    # Clean up the previous generation's widget state to avoid session bloat.
+    prev_prefix = f"dlg_{key_prefix}_g{gen - 1}_"
+    for k in [k for k in st.session_state if k.startswith(prev_prefix)]:
+        del st.session_state[k]
+
     from features.loader import load_features
     catalog = load_features()
     feature = catalog.get(feature_id) if feature_id else None
@@ -286,16 +372,17 @@ def open_chart_editor_dialog(
 
     chart_col, editor_col = st.columns([3, 2])
 
-    # Render editor first so new_view is available for the chart render below.
+    # Render editor first inside a scrollable container so new_view is available.
     with editor_col:
-        new_view = render_chart_editor(
-            chart_view=view,
-            df=df,
-            feature_columns=feature_columns,
-            feature=feature,
-            recipe_chart=recipe_chart,
-            key_prefix=f"dlg_{key_prefix}",
-        )
+        with st.container(height=520, border=False):
+            new_view = render_chart_editor(
+                chart_view=view,
+                df=df,
+                feature_columns=feature_columns,
+                feature=feature,
+                recipe_chart=recipe_chart,
+                key_prefix=editor_key_prefix,
+            )
 
     invalid_msg: str | None = None
     fig = None
@@ -310,27 +397,22 @@ def open_chart_editor_dialog(
             st.error(f"Cannot render: {invalid_msg}")
         elif fig is not None:
             st.plotly_chart(fig, use_container_width=True)
-
-    with editor_col:
         st.divider()
-        btn_cols = st.columns([1, 1, 2])
+        btn_cols = st.columns(2)
         with btn_cols[0]:
-            if st.button("Reset", key=f"dlg_reset_{key_prefix}"):
+            if st.button("Reset", key=f"dlg_reset_{key_prefix}", use_container_width=True):
                 if feature:
                     st.session_state[view_state_key] = default_chart_view(
                         feature, recipe_chart=recipe_chart
                     )
                 st.rerun()
         with btn_cols[1]:
-            if st.button("Apply", key=f"dlg_apply_{key_prefix}"):
-                st.session_state[view_state_key] = new_view
-                st.rerun()
-        with btn_cols[2]:
             if st.button(
                 save_label,
                 key=f"dlg_save_{key_prefix}",
                 disabled=bool(invalid_msg),
                 type="primary",
+                use_container_width=True,
             ):
                 st.session_state[view_state_key] = new_view
                 st.session_state[save_pending_key] = new_view.to_dict()

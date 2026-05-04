@@ -18,10 +18,11 @@ def render_chart_with_actions(
     chart_meta: ChartMeta,
     message_index: int,
     on_save: Callable[[ChartMeta, ChartView], None],
-    on_rename: Callable[[ChartMeta, str], None],
+    on_duplicate: Callable[[ChartMeta, ChartView], None],
+    on_delete: Callable[[ChartMeta], None],
     saved_keys: set[str],
 ) -> None:
-    """Render a savable direct chart card with an Edit button that opens a dialog."""
+    """Render a savable direct chart card with Edit / Copy / Delete actions."""
     if chart_meta.mode != "direct":
         st.warning(
             f"render_chart_with_actions called with non-direct chart "
@@ -36,7 +37,6 @@ def render_chart_with_actions(
     if view_state_key not in st.session_state:
         st.session_state[view_state_key] = ChartView.from_dict(chart_meta.chart_view)
 
-    # Handle save signalled from the dialog (runs after dialog closes + app reruns).
     if save_pending_key in st.session_state:
         pending_view = ChartView.from_dict(st.session_state.pop(save_pending_key))
         on_save(chart_meta, pending_view)
@@ -55,21 +55,29 @@ def render_chart_with_actions(
         df = pd.DataFrame()
     feature_columns = feature.columns if feature else {}
 
+    already_saved = recipe_hash(chart_meta.recipe) in saved_keys
+
     container = st.container(border=True)
     with container:
-        name_col, edit_col = st.columns([5, 1])
-        with name_col:
-            new_name = st.text_input(
-                "Chart name",
-                value=view.title,
-                key=f"{key_prefix}_name",
-                label_visibility="collapsed",
-            )
-            if new_name != view.title:
-                view.title = new_name
-                on_rename(chart_meta, new_name)
+        title_col, save_col, edit_col, copy_col, del_col = st.columns([5, 1, 1, 1, 1])
+        with title_col:
+            st.markdown(f"**{view.title}**")
+            if view.subtitle:
+                st.caption(view.subtitle)
+        with save_col:
+            if st.button(
+                "💾",
+                key=f"{key_prefix}_save_btn",
+                use_container_width=True,
+                help="Saved to Dashboard" if already_saved else "Save to Dashboard",
+                disabled=already_saved,
+            ):
+                on_save(chart_meta, view)
+                st.rerun()
         with edit_col:
-            if st.button("Edit", key=f"{key_prefix}_edit_btn", use_container_width=True):
+            if st.button("✏️", key=f"{key_prefix}_edit_btn", use_container_width=True, help="Edit chart"):
+                gen_key = f"{key_prefix}_dlg_gen"
+                st.session_state[gen_key] = st.session_state.get(gen_key, 0) + 1
                 open_chart_editor_dialog(
                     view_state_key=view_state_key,
                     data_columnar=chart_meta.data_columnar,
@@ -79,6 +87,15 @@ def render_chart_with_actions(
                     save_pending_key=save_pending_key,
                     save_label="Save to Dashboard",
                 )
+        with copy_col:
+            if st.button("⧉", key=f"{key_prefix}_copy_btn", use_container_width=True, help="Copy to Dashboard"):
+                on_duplicate(chart_meta, view)
+                st.toast("Copied to Dashboard.")
+                st.rerun()
+        with del_col:
+            if st.button("🗑️", key=f"{key_prefix}_delete_btn", use_container_width=True, help="Delete"):
+                on_delete(chart_meta)
+                st.rerun()
 
         invalid_msg: str | None = None
         try:
@@ -99,7 +116,3 @@ def render_chart_with_actions(
             name=view.title,
             key_suffix=f"direct_{message_index}_{chart_meta.chart_id}",
         )
-
-        already_saved = recipe_hash(chart_meta.recipe) in saved_keys
-        if already_saved:
-            st.caption("Saved to Dashboard.")

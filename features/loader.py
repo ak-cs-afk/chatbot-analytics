@@ -6,10 +6,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
+from charts.units import ALLOWED_UNITS
+
 DEFAULT_PATH = "data/features.json"
 
 ALLOWED_KINDS = {"dimension", "measure"}
-ALLOWED_UNITS = {"usd", "pct", "count", "hours", "days", "date", "string", "number"}
 
 
 class FeaturesValidationError(ValueError):

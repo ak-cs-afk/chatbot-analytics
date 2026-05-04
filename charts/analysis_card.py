@@ -19,6 +19,8 @@ def render_analysis_card(
     source_charts: list[ChartMeta],
     message_index: int,
     on_save_source: Callable[[ChartMeta, ChartView], None],
+    on_duplicate_source: Callable[[ChartMeta, ChartView], None],
+    on_delete_source: Callable[[ChartMeta], None],
 ) -> None:
     """Render the analysis block (methodology + recipe expander) and its source charts."""
     container = st.container(border=True)
@@ -40,16 +42,24 @@ def render_analysis_card(
         cols = st.columns(2)
         for i, cm in enumerate(source_charts):
             with cols[i % 2]:
-                _render_source_chart(cm, message_index, card.analysis_id, on_save_source)
+                _render_source_chart(
+                    cm, message_index, card.analysis_id,
+                    on_save_source, on_duplicate_source, on_delete_source,
+                )
     else:
-        _render_source_chart(source_charts[0], message_index, card.analysis_id, on_save_source)
+        _render_source_chart(
+            source_charts[0], message_index, card.analysis_id,
+            on_save_source, on_duplicate_source, on_delete_source,
+        )
 
 
 def _render_source_chart(
     cm: ChartMeta,
     message_index: int,
     analysis_id: int,
-    on_save_source: Callable[[ChartMeta, ChartView], None],
+    on_save: Callable[[ChartMeta, ChartView], None],
+    on_duplicate: Callable[[ChartMeta, ChartView], None],
+    on_delete: Callable[[ChartMeta], None],
 ) -> None:
     key_prefix = f"src_{message_index}_{analysis_id}_{cm.chart_id}"
     view_state_key = f"{key_prefix}_view"
@@ -58,10 +68,9 @@ def _render_source_chart(
     if view_state_key not in st.session_state:
         st.session_state[view_state_key] = ChartView.from_dict(cm.chart_view)
 
-    # Handle save signalled from dialog.
     if save_pending_key in st.session_state:
         pending_view = ChartView.from_dict(st.session_state.pop(save_pending_key))
-        on_save_source(cm, pending_view)
+        on_save(cm, pending_view)
 
     view: ChartView = st.session_state[view_state_key]
 
@@ -76,11 +85,15 @@ def _render_source_chart(
 
     sub = st.container(border=True)
     with sub:
-        title_col, edit_col = st.columns([5, 1])
+        title_col, edit_col, copy_col, del_col = st.columns([6, 1, 1, 1])
         with title_col:
             st.markdown(f"**{view.title}**")
+            if view.subtitle:
+                st.caption(view.subtitle)
         with edit_col:
-            if st.button("Edit", key=f"{key_prefix}_edit_btn", use_container_width=True):
+            if st.button("✏️", key=f"{key_prefix}_edit_btn", use_container_width=True, help="Edit chart"):
+                gen_key = f"{key_prefix}_dlg_gen"
+                st.session_state[gen_key] = st.session_state.get(gen_key, 0) + 1
                 open_chart_editor_dialog(
                     view_state_key=view_state_key,
                     data_columnar=cm.data_columnar,
@@ -90,6 +103,15 @@ def _render_source_chart(
                     save_pending_key=save_pending_key,
                     save_label="Save to Dashboard",
                 )
+        with copy_col:
+            if st.button("⧉", key=f"{key_prefix}_copy_btn", use_container_width=True, help="Copy to Dashboard"):
+                on_duplicate(cm, view)
+                st.toast("Copied to Dashboard.")
+                st.rerun()
+        with del_col:
+            if st.button("🗑️", key=f"{key_prefix}_delete_btn", use_container_width=True, help="Delete"):
+                on_delete(cm)
+                st.rerun()
 
         invalid_msg: str | None = None
         try:

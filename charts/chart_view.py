@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 import pandas as pd
 
+from charts.units import ALLOWED_UNITS, CURRENCY_UNITS
 from features.loader import ColumnMeta, Feature
 
 logger = logging.getLogger(__name__)
@@ -14,9 +15,12 @@ logger = logging.getLogger(__name__)
 # ---------- Constants ----------
 
 ALLOWED_FILTER_OPS = {"==", "!=", "<", "<=", ">", ">=", "in", "between"}
-ALLOWED_UNITS = {"usd", "pct", "count", "hours", "days", "date", "string", "number"}
 
-SINGLE_MEASURE_TYPES = {"pie", "heatmap", "funnel", "histogram", "box", "horizontal_bar"}
+ALLOWED_SORT_DIRS = {"asc", "desc"}
+
+SINGLE_MEASURE_TYPES = {
+    "pie", "heatmap", "funnel", "histogram", "box", "horizontal_bar", "indicator",
+}
 MULTI_MEASURE_TYPES = {"line", "bar", "scatter"}
 GROUPED_TYPES = {"grouped_bar"}
 ALL_TYPES = SINGLE_MEASURE_TYPES | MULTI_MEASURE_TYPES | GROUPED_TYPES
@@ -58,6 +62,8 @@ class AxisHints:
     left_y_label: str
     right_y_unit: str | None = None
     right_y_label: str | None = None
+    column_label_map: dict[str, str] = field(default_factory=dict)
+    column_unit_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,6 +76,9 @@ class ChartView:
     column_labels: dict[str, str] = field(default_factory=dict)
     column_units: dict[str, str] = field(default_factory=dict)
     filters: list[ChartViewFilter] = field(default_factory=list)
+    subtitle: str = ""
+    sort_by: str | None = None
+    sort_dir: str = "desc"
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +90,9 @@ class ChartView:
             "column_labels": dict(self.column_labels),
             "column_units": dict(self.column_units),
             "filters": [f.to_dict() for f in self.filters],
+            "subtitle": self.subtitle,
+            "sort_by": self.sort_by,
+            "sort_dir": self.sort_dir,
         }
 
     @classmethod
@@ -118,6 +130,12 @@ class ChartView:
             raise ChartViewError("chart_view.filters must be a list.")
         filters = [ChartViewFilter.from_dict(f) for f in filters_raw]
 
+        sort_dir = raw.get("sort_dir", "desc") or "desc"
+        if sort_dir not in ALLOWED_SORT_DIRS:
+            raise ChartViewError(
+                f"chart_view.sort_dir '{sort_dir}' not in {sorted(ALLOWED_SORT_DIRS)}."
+            )
+
         return cls(
             title=title,
             type=ctype,
@@ -127,6 +145,9 @@ class ChartView:
             column_labels=dict(labels_raw),
             column_units=dict(units_raw),
             filters=filters,
+            subtitle=raw.get("subtitle", "") or "",
+            sort_by=raw.get("sort_by"),
+            sort_dir=sort_dir,
         )
 
 
@@ -136,11 +157,6 @@ def default_chart_view(
     feature: Feature,
     recipe_chart: dict | None = None,
 ) -> ChartView:
-    """Build the initial chart_view for a chart.
-
-    For direct charts: pass the recipe.chart block (if present).
-    For derived analysis source charts: pass recipe_chart=None - we use feature hints.
-    """
     if recipe_chart:
         ctype = recipe_chart.get("type") or feature.suggested_chart or "bar"
         x = recipe_chart.get("x") or feature.x_field or _first_column_of_kind(feature, "dimension")
@@ -172,6 +188,9 @@ def default_chart_view(
         column_labels={},
         column_units={},
         filters=[],
+        subtitle="",
+        sort_by=None,
+        sort_dir="desc",
     )
 
 
@@ -189,10 +208,7 @@ def apply(
     df: pd.DataFrame,
     feature_columns: dict[str, ColumnMeta],
 ) -> tuple[pd.DataFrame, AxisHints]:
-    """Apply post-execution filters and resolve axis hints.
-
-    Returns (filtered_df, axis_hints). filter mismatches are logged & skipped.
-    """
+    """Filter, sort, and resolve axis hints + label/unit maps for the renderer."""
     out = df
     for flt in view.filters:
         if flt.column not in out.columns:
@@ -206,6 +222,15 @@ def apply(
             logger.warning("Skipping bad filter %s: %s", flt.to_dict(), exc)
 
     out = out.reset_index(drop=True)
+
+    if view.sort_by and view.sort_by in out.columns:
+        out = out.sort_values(
+            by=view.sort_by, ascending=(view.sort_dir == "asc")
+        ).reset_index(drop=True)
+    elif view.sort_by:
+        logger.warning(
+            "ChartView sort_by '%s' not in result columns; skipping.", view.sort_by
+        )
 
     x_unit = _resolve_unit(view.x, view, feature_columns)
     x_label = _resolve_label(view.x, view, feature_columns)
@@ -237,6 +262,16 @@ def apply(
         else:
             right_y_label = ""
 
+    # Build complete maps for every column referenced by the view.
+    referenced = {view.x, *view.y}
+    if view.color:
+        referenced.add(view.color)
+    column_label_map: dict[str, str] = {}
+    column_unit_map: dict[str, str] = {}
+    for col in referenced:
+        column_label_map[col] = _resolve_label(col, view, feature_columns)
+        column_unit_map[col] = _resolve_unit(col, view, feature_columns)
+
     hints = AxisHints(
         x_unit=x_unit,
         x_label=x_label,
@@ -244,6 +279,8 @@ def apply(
         left_y_label=left_y_label,
         right_y_unit=right_unit,
         right_y_label=right_y_label,
+        column_label_map=column_label_map,
+        column_unit_map=column_unit_map,
     )
     return out, hints
 

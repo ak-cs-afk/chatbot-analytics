@@ -12,16 +12,17 @@ from charts.chart_view import (
     SINGLE_MEASURE_TYPES,
     GROUPED_TYPES,
 )
+from charts.units import CURRENCY_SYMBOLS
 
 
-ALLOWED_TYPES = ALL_TYPES  # back-compat re-export for any consumers
+ALLOWED_TYPES = ALL_TYPES  # back-compat re-export
+
+
+PALETTE = px.colors.qualitative.Set2
 
 
 class ChartSpecError(ValueError):
     """Raised when a chart spec is invalid for the given data."""
-
-
-PALETTE = px.colors.qualitative.Set2
 
 
 # ---------- Public entry ----------
@@ -32,16 +33,17 @@ def render(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
             f"Unsupported chart type '{view.type}'. Allowed: {sorted(ALL_TYPES)}"
         )
 
-    # Validate columns referenced by the view exist in df.
     referenced = [view.x, *view.y]
     if view.color:
         referenced.append(view.color)
-    missing = [c for c in referenced if c not in df.columns]
+    missing = [c for c in referenced if view.type != "indicator" and c not in df.columns]
     if missing:
         raise ChartSpecError(
             f"Columns {missing} not in result data. Available: {list(df.columns)}"
         )
 
+    if view.type == "indicator":
+        return _render_indicator(view, df, hints)
     if view.type in MULTI_MEASURE_TYPES:
         return _render_multi_measure(view, df, hints)
     if view.type in GROUPED_TYPES:
@@ -51,38 +53,63 @@ def render(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
     return _render_single_measure(view, df, hints)
 
 
+# ---------- Indicator ----------
+
+def _render_indicator(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
+    y_col = view.y[0]
+    if y_col not in df.columns or df.empty:
+        raise ChartSpecError(f"Indicator needs column '{y_col}' with at least 1 row.")
+    value = float(df[y_col].iloc[-1])
+    unit = hints.left_y_unit
+    number_fmt = _indicator_number_format(unit)
+    fig = go.Figure(
+        go.Indicator(
+            mode="number",
+            value=value,
+            number=number_fmt,
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=20, r=20, t=20, b=20),
+        height=240,
+    )
+    return fig
+
+
+def _indicator_number_format(unit: str) -> dict:
+    if unit in CURRENCY_SYMBOLS:
+        return {"prefix": CURRENCY_SYMBOLS[unit], "valueformat": ",.0f"}
+    if unit == "pct":
+        return {"suffix": "%", "valueformat": ".1f"}
+    if unit == "count":
+        return {"valueformat": ",.0f"}
+    if unit == "hours":
+        return {"suffix": "h", "valueformat": ".1f"}
+    if unit == "days":
+        return {"suffix": "d", "valueformat": ".1f"}
+    return {"valueformat": ",.2f"}
+
+
 # ---------- Multi-measure (line / bar / scatter) ----------
 
 def _render_multi_measure(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
-    fig = go.Figure()
     if view.color and len(view.y) == 1:
         return _render_single_color_grouped(view, df, hints)
 
-    # Determine each Y series' unit so we know which axis to assign.
-    from charts.chart_view import _resolve_unit  # type: ignore
-
-    units = []  # We can't import the feature_columns here; rely on hints semantics.
-    # The hints already encode left/right unit. We classify each Y by unit equality.
-    # Resolve units from view.column_units (overrides) only; the renderer trusts
-    # hints for the axis decision and treats remaining columns as left.
-    for col in view.y:
-        units.append(view.column_units.get(col))
-
+    fig = go.Figure()
     for i, col in enumerate(view.y):
-        # If the explicit override matches the right unit -> right axis.
-        # Otherwise: if there's a right axis and we have N=2 measures, second goes right.
-        secondary = (
-            hints.right_y_unit is not None
-            and units[i] == hints.right_y_unit
-        )
-        if hints.right_y_unit is not None and not any(units):
-            secondary = (i == 1)  # fall back to "second measure goes right" when overrides absent
-
+        col_unit = hints.column_unit_map.get(col, hints.left_y_unit)
+        secondary = hints.right_y_unit is not None and col_unit == hints.right_y_unit
         color = PALETTE[i % len(PALETTE)]
+        col_label = hints.column_label_map.get(col, col)
+        hover = _hover_template(col_unit, col_label)
+
         trace_kwargs = dict(
             x=df[view.x],
             y=df[col],
-            name=col,
+            name=col_label,
+            hovertemplate=hover,
         )
         if view.type == "line":
             fig.add_trace(go.Scatter(
@@ -107,9 +134,8 @@ def _render_multi_measure(view: ChartView, df: pd.DataFrame, hints: AxisHints) -
             ))
 
     layout = dict(
-        title=view.title,
         template="plotly_white",
-        margin=dict(l=40, r=40, t=50, b=40),
+        margin=dict(l=40, r=40, t=20, b=40),
         xaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),
         yaxis=_axis_layout(hints.left_y_unit, hints.left_y_label),
     )
@@ -125,19 +151,21 @@ def _render_multi_measure(view: ChartView, df: pd.DataFrame, hints: AxisHints) -
 
 
 def _render_single_color_grouped(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
-    # Single Y measure with a color column: use plotly.express for the convenience.
     y_col = view.y[0]
     if view.type == "line":
-        fig = px.line(df, x=view.x, y=y_col, color=view.color, title=view.title)
+        fig = px.line(df, x=view.x, y=y_col, color=view.color)
     elif view.type == "bar":
-        fig = px.bar(df, x=view.x, y=y_col, color=view.color, title=view.title)
+        fig = px.bar(df, x=view.x, y=y_col, color=view.color)
     elif view.type == "scatter":
-        fig = px.scatter(df, x=view.x, y=y_col, color=view.color, title=view.title)
+        fig = px.scatter(df, x=view.x, y=y_col, color=view.color)
     else:
         raise ChartSpecError(f"Color grouping not supported for type '{view.type}'.")
+    y_unit = hints.column_unit_map.get(y_col, hints.left_y_unit)
+    y_label = hints.column_label_map.get(y_col, y_col)
+    fig.update_traces(hovertemplate=_hover_template(y_unit, y_label))
     fig.update_layout(
         template="plotly_white",
-        margin=dict(l=40, r=20, t=50, b=40),
+        margin=dict(l=40, r=20, t=20, b=40),
         xaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),
         yaxis=_axis_layout(hints.left_y_unit, hints.left_y_label),
     )
@@ -149,11 +177,11 @@ def _render_single_color_grouped(view: ChartView, df: pd.DataFrame, hints: AxisH
 def _render_single_measure(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> go.Figure:
     y = view.y[0]
     if view.type == "pie":
-        fig = px.pie(df, names=view.x, values=y, title=view.title)
+        fig = px.pie(df, names=view.x, values=y)
     elif view.type == "histogram":
-        fig = px.histogram(df, x=view.x, color=view.color, title=view.title)
+        fig = px.histogram(df, x=view.x, color=view.color)
     elif view.type == "box":
-        fig = px.box(df, y=y, x=view.x, color=view.color, title=view.title)
+        fig = px.box(df, y=y, x=view.x, color=view.color)
     elif view.type == "heatmap":
         if view.color is None:
             raise ChartSpecError("heatmap requires color (z) field via view.color.")
@@ -161,15 +189,16 @@ def _render_single_measure(view: ChartView, df: pd.DataFrame, hints: AxisHints) 
         fig = go.Figure(
             data=go.Heatmap(z=pivot.values, x=list(pivot.columns), y=list(pivot.index))
         )
-        fig.update_layout(title=view.title)
     elif view.type == "funnel":
         fig = go.Figure(go.Funnel(x=df[y], y=df[view.x]))
-        fig.update_layout(title=view.title)
     else:
         raise ChartSpecError(f"Unhandled single-measure type: {view.type}")
 
-    fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=20, b=40))
     if view.type in {"box", "histogram"}:
+        y_unit = hints.column_unit_map.get(y, hints.left_y_unit)
+        y_label = hints.column_label_map.get(y, y)
+        fig.update_traces(hovertemplate=_hover_template(y_unit, y_label))
         fig.update_layout(
             xaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),
             yaxis=_axis_layout(hints.left_y_unit, hints.left_y_label),
@@ -194,11 +223,11 @@ def _render_grouped_bar(view: ChartView, df: pd.DataFrame, hints: AxisHints) -> 
         y="value",
         color="series",
         barmode="group",
-        title=view.title,
     )
+    fig.update_traces(hovertemplate=_hover_template(hints.left_y_unit, "Value"))
     fig.update_layout(
         template="plotly_white",
-        margin=dict(l=40, r=20, t=50, b=40),
+        margin=dict(l=40, r=20, t=20, b=40),
         xaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),
         yaxis=_axis_layout(hints.left_y_unit, hints.left_y_label),
     )
@@ -216,23 +245,25 @@ def _render_horizontal_bar(view: ChartView, df: pd.DataFrame, hints: AxisHints) 
         y=view.x,
         color=view.color,
         orientation="h",
-        title=view.title,
     )
+    y_unit = hints.column_unit_map.get(y, hints.left_y_unit)
+    y_label = hints.column_label_map.get(y, y)
+    fig.update_traces(hovertemplate=f"{y_label}: " + _value_format(y_unit) + "<extra></extra>")
     fig.update_layout(
         template="plotly_white",
-        margin=dict(l=40, r=20, t=50, b=40),
-        xaxis=_axis_layout(hints.left_y_unit, hints.left_y_label or y),  # numeric on x
-        yaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),       # categories on y
+        margin=dict(l=40, r=20, t=20, b=40),
+        xaxis=_axis_layout(hints.left_y_unit, hints.left_y_label or y),
+        yaxis=_axis_layout(hints.x_unit, hints.x_label or view.x),
     )
     return fig
 
 
-# ---------- Axis layout helper ----------
+# ---------- Axis + hover helpers ----------
 
 def _axis_layout(unit: str, label: str, **extra) -> dict:
     base: dict = {"title": label, **extra}
-    if unit == "usd":
-        base["tickprefix"] = "$"
+    if unit in CURRENCY_SYMBOLS:
+        base["tickprefix"] = CURRENCY_SYMBOLS[unit]
         base["separatethousands"] = True
     elif unit == "pct":
         base["ticksuffix"] = "%"
@@ -244,5 +275,23 @@ def _axis_layout(unit: str, label: str, **extra) -> dict:
         base["ticksuffix"] = "d"
     elif unit == "date":
         base["type"] = "date"
-    # number / string -> no formatter
     return base
+
+
+def _hover_template(unit: str, label: str) -> str:
+    val = _value_format(unit)
+    return f"%{{x}}<br>{label}: {val}<extra></extra>"
+
+
+def _value_format(unit: str) -> str:
+    if unit in CURRENCY_SYMBOLS:
+        return f"{CURRENCY_SYMBOLS[unit]}%{{y:,.0f}}"
+    if unit == "pct":
+        return "%{y:.1f}%"
+    if unit == "count":
+        return "%{y:,}"
+    if unit == "hours":
+        return "%{y:.1f}h"
+    if unit == "days":
+        return "%{y:.1f}d"
+    return "%{y}"

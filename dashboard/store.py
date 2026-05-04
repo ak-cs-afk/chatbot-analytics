@@ -54,18 +54,25 @@ def load_saved_charts(path: str = DEFAULT_PATH) -> list[SavedChart]:
         return []
 
 
-def save_chart(name: str, recipe: dict, chart_view: dict, path: str = DEFAULT_PATH) -> SavedChart:
-    """Insert or update a saved chart by recipe_hash."""
+def save_chart(
+    name: str,
+    recipe: dict,
+    chart_view: dict,
+    path: str = DEFAULT_PATH,
+    force_new: bool = False,
+) -> SavedChart:
+    """Insert or update a saved chart by recipe_hash. force_new=True always inserts."""
     existing = load_saved_charts(path)
     fingerprint = recipe_hash(recipe)
     now = datetime.now(timezone.utc).isoformat()
-    for sc in existing:
-        if recipe_hash(sc.recipe) == fingerprint:
-            sc.name = name
-            sc.chart_view = chart_view
-            sc.updated_at = now
-            _atomic_write(existing, path)
-            return sc
+    if not force_new:
+        for sc in existing:
+            if recipe_hash(sc.recipe) == fingerprint:
+                sc.name = name
+                sc.chart_view = chart_view
+                sc.updated_at = now
+                _atomic_write(existing, path)
+                return sc
 
     new = SavedChart(
         id=str(uuid.uuid4()),
@@ -95,6 +102,27 @@ def update_chart_view(saved_id: str, chart_view: dict, path: str = DEFAULT_PATH)
         return None
     _atomic_write(existing, path)
     return target
+
+
+def duplicate_chart(saved_id: str, path: str = DEFAULT_PATH) -> SavedChart | None:
+    existing = load_saved_charts(path)
+    src = next((sc for sc in existing if sc.id == saved_id), None)
+    if src is None:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    new_title = f"{src.chart_view.get('title', src.name)} (copy)"
+    new_chart_view = {**src.chart_view, "title": new_title}
+    new = SavedChart(
+        id=str(uuid.uuid4()),
+        name=f"{src.name} (copy)",
+        recipe=src.recipe,
+        chart_view=new_chart_view,
+        created_at=now,
+        updated_at=now,
+    )
+    existing.append(new)
+    _atomic_write(existing, path)
+    return new
 
 
 def rename_chart(saved_id: str, new_name: str, path: str = DEFAULT_PATH) -> SavedChart | None:
@@ -150,3 +178,26 @@ def _backup_corrupt_file(file_path: Path) -> Path:
     except OSError:
         backup.write_text(file_path.read_text(encoding="utf-8"), encoding="utf-8")
     return backup
+
+
+def relative_time(iso_str: str) -> str:
+    """Format an ISO-8601 UTC timestamp as a relative human-readable string."""
+    try:
+        when = datetime.fromisoformat(iso_str)
+    except (TypeError, ValueError):
+        return iso_str or "unknown"
+    now = datetime.now(when.tzinfo) if when.tzinfo else datetime.utcnow()
+    delta = now - when
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        m = seconds // 60
+        return f"{m} minute{'s' if m != 1 else ''} ago"
+    if seconds < 86400:
+        h = seconds // 3600
+        return f"{h} hour{'s' if h != 1 else ''} ago"
+    if seconds < 7 * 86400:
+        d = seconds // 86400
+        return f"{d} day{'s' if d != 1 else ''} ago"
+    return when.strftime("%Y-%m-%d")

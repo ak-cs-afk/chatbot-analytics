@@ -15,8 +15,9 @@ from dashboard.store import (
     DEFAULT_PATH as SAVED_CHARTS_PATH,
     SavedChart,
     delete_chart,
+    duplicate_chart,
     load_saved_charts,
-    rename_chart,
+    relative_time,
     update_chart_view,
 )
 from features.loader import load_features, reload_features
@@ -51,7 +52,6 @@ def _render_tile(sc: SavedChart, catalog: dict) -> None:
     view_state_key = f"{key_prefix}_view"
     update_pending_key = f"{key_prefix}_update_pending"
 
-    # Initialise chart_view from session state.
     if view_state_key not in st.session_state:
         try:
             st.session_state[view_state_key] = ChartView.from_dict(sc.chart_view)
@@ -64,7 +64,6 @@ def _render_tile(sc: SavedChart, catalog: dict) -> None:
                     st.rerun()
             return
 
-    # Handle update signalled from the edit dialog.
     if update_pending_key in st.session_state:
         pending_dict = st.session_state.pop(update_pending_key)
         update_chart_view(sc.id, pending_dict, SAVED_CHARTS_PATH)
@@ -72,7 +71,6 @@ def _render_tile(sc: SavedChart, catalog: dict) -> None:
 
     view: ChartView = st.session_state[view_state_key]
 
-    # Re-execute recipe to get fresh data.
     recipe_error: str | None = None
     result = None
     try:
@@ -97,20 +95,15 @@ def _render_tile(sc: SavedChart, catalog: dict) -> None:
         feature = catalog.get(feature_id)
         feature_columns = feature.columns if feature else {}
 
-        name_col, edit_col = st.columns([5, 1])
-        with name_col:
-            new_name = st.text_input(
-                "Chart name",
-                value=view.title,
-                key=f"{key_prefix}_name",
-                label_visibility="collapsed",
-            )
-            if new_name != view.title:
-                view.title = new_name
-                rename_chart(sc.id, new_name, SAVED_CHARTS_PATH)
+        title_col, edit_col, copy_col, del_col = st.columns([6, 1, 1, 1])
+        with title_col:
+            st.markdown(f"**{view.title}**")
+            if view.subtitle:
+                st.caption(view.subtitle)
         with edit_col:
-            if st.button("Edit", key=f"{key_prefix}_edit_btn", use_container_width=True):
-                # Pass the live df as columnar so the dialog has the latest data.
+            if st.button("✏️", key=f"{key_prefix}_edit_btn", use_container_width=True, help="Edit chart"):
+                gen_key = f"{key_prefix}_dlg_gen"
+                st.session_state[gen_key] = st.session_state.get(gen_key, 0) + 1
                 live_columnar = {
                     "columns": list(df.columns),
                     "rows": df.values.tolist(),
@@ -122,8 +115,17 @@ def _render_tile(sc: SavedChart, catalog: dict) -> None:
                     recipe_chart=sc.recipe.get("chart"),
                     key_prefix=key_prefix,
                     save_pending_key=update_pending_key,
-                    save_label="Update",
+                    save_label="Save",
                 )
+        with copy_col:
+            if st.button("⧉", key=f"{key_prefix}_copy_btn", use_container_width=True, help="Duplicate tile"):
+                duplicate_chart(sc.id, SAVED_CHARTS_PATH)
+                st.toast("Tile duplicated.")
+                st.rerun()
+        with del_col:
+            if st.button("🗑️", key=f"{key_prefix}_delete_btn", use_container_width=True, help="Delete"):
+                delete_chart(sc.id, SAVED_CHARTS_PATH)
+                st.rerun()
 
         invalid_msg: str | None = None
         try:
@@ -141,6 +143,4 @@ def _render_tile(sc: SavedChart, catalog: dict) -> None:
         data_columnar = {"columns": list(df.columns), "rows": df.values.tolist()}
         render_raw_data_expander(data_columnar=data_columnar, name=view.title, key_suffix=key_prefix)
 
-        if st.button("Delete", key=f"{key_prefix}_delete"):
-            delete_chart(sc.id, SAVED_CHARTS_PATH)
-            st.rerun()
+        st.caption(f"Updated {relative_time(sc.updated_at)}.")

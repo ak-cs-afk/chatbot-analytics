@@ -130,7 +130,14 @@ def _render_analysis_and_charts(
     for card in analysis_cards:
         chart_ids_in_cards.update(card.source_chart_ids)
         source_charts = [chart_by_id[cid] for cid in card.source_chart_ids if cid in chart_by_id]
-        render_analysis_card(card, source_charts, message_index, on_save_source=_on_save_chart)
+        render_analysis_card(
+            card,
+            source_charts,
+            message_index,
+            on_save_source=_on_save_chart,
+            on_duplicate_source=_on_duplicate_chart,
+            on_delete_source=lambda cm, idx=message_index: _on_delete_chart(cm, idx),
+        )
 
     standalone = [cm for cm in charts if cm.chart_id not in chart_ids_in_cards and cm.mode == "direct"]
     if not standalone:
@@ -151,7 +158,8 @@ def _render_one(cm: ChartMeta, message_index: int) -> None:
         chart_meta=cm,
         message_index=message_index,
         on_save=_on_save_chart,
-        on_rename=_on_rename,
+        on_duplicate=_on_duplicate_chart,
+        on_delete=lambda chart_meta, idx=message_index: _on_delete_chart(chart_meta, idx),
         saved_keys=st.session_state.saved_chart_keys,
     )
 
@@ -168,8 +176,29 @@ def _on_save_chart(cm: ChartMeta, view: ChartView) -> None:
     st.toast(f"Saved '{saved.name}' to Dashboard.")
 
 
-def _on_rename(cm: ChartMeta, new_name: str) -> None:
-    cm.name = new_name
+def _on_duplicate_chart(cm: ChartMeta, view: ChartView) -> None:
+    copy_view = ChartView.from_dict(view.to_dict())
+    copy_view.title = f"{copy_view.title} (copy)"
+    saved = save_chart(
+        name=copy_view.title,
+        recipe=cm.recipe,
+        chart_view=copy_view.to_dict(),
+        path=SAVED_CHARTS_PATH,
+        force_new=True,
+    )
+    st.session_state.saved_chart_keys.add(recipe_hash(saved.recipe))
+
+
+def _on_delete_chart(cm: ChartMeta, message_index: int) -> None:
+    """Hide the chart from this message's chart list (current session only)."""
+    try:
+        msg = st.session_state.messages[message_index]
+    except (IndexError, KeyError):
+        return
+    msg["charts"] = [c for c in msg.get("charts", []) if c.chart_id != cm.chart_id]
+    for card in msg.get("analysis_cards", []) or []:
+        if cm.chart_id in card.source_chart_ids:
+            card.source_chart_ids = [cid for cid in card.source_chart_ids if cid != cm.chart_id]
 
 
 def _to_chat_history(messages: list[dict]) -> list[dict]:
